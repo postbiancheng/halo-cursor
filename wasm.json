@@ -1,0 +1,27 @@
+{
+  "abi": 1,
+  "verified": false,
+  "requires": [
+    "http.v1",
+    "http.timeout.v1",
+    "accounts.cas.v1",
+    "chat.stream.v1",
+    "clock.v1",
+    "random.v1",
+    "state.v1",
+    "login.forms.v1",
+    "login.interaction.v1",
+    "locks.v1",
+    "settings.v1",
+    "settings.schema.v1",
+    "catalog.v1"
+  ],
+  "origins": [
+    "https://api2.cursor.sh",
+    "https://cursor.com",
+    "https://www.cursor.com",
+    "https://agentn.global.api5.cursor.sh"
+  ],
+  "memory_mib": 128,
+  "concurrency": 8
+}
