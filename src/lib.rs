@@ -73,7 +73,7 @@ fn public(secret: &Value) -> Value {
     let name = email.unwrap_or("Halo Cursor");
     let mut view = json!({
         "name": name,
-        "accountId": secret["accountId"],
+        "accountId": auth::public_account_id(secret),
         "plan": secret["plan"],
         "expiresAt": secret["expiresAt"],
         "tokenExpiresAt": secret["expiresAt"]
@@ -130,10 +130,9 @@ fn handle(method: &str, mut params: Value) -> Result<Value> {
         "admin.action" => admin(&params),
         "usage.query" => usage::query(),
         "conversation" => {
-            let account = auth::credentials(false)?;
             let body =
                 sdk::take_body(&mut params).ok_or_else(|| Error::http(400, "请求缺少正文"))?;
-            chat::forward(body, &params, &account)?;
+            chat::forward(body)?;
             Ok(Value::Null)
         }
         "token.ensure" => Ok(auth::credentials(false)?["accessToken"].clone()),

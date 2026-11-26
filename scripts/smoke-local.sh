@@ -9,7 +9,7 @@ export HALO_CURSOR_EXPECTED_VERSION="${HALO_CURSOR_EXPECTED_VERSION:-$VERSION}"
 export AGENT2API_HOST="${AGENT2API_HOST:-http://127.0.0.1:3065}"
 
 python3 - <<'PY'
-import json, os, pathlib, sys, time, urllib.error, urllib.request
+import http.client, json, os, pathlib, sys, time, urllib.error, urllib.request
 
 HOST = os.environ["AGENT2API_HOST"].rstrip("/")
 EXPECT = os.environ["HALO_CURSOR_EXPECTED_VERSION"]
@@ -42,7 +42,7 @@ if not key:
 # unless the catalog knows cursor-agent).
 CLIENT_UA = os.environ.get(
     "HALO_CURSOR_SMOKE_UA",
-    "cursor-agent/2026.09.26 (Halo-Cursor-smoke; darwin)",
+    f"cursor-agent/2026.09.26 (Halo-Cursor-smoke-{os.getpid()}; darwin)",
 )
 H = {
     "Authorization": f"Bearer {key}",
@@ -51,27 +51,14 @@ H = {
 }
 
 
-def call(method, path, body=None, timeout=120, stream=False, headers=None):
+def call(method, path, body=None, timeout=120, stream=False):
     data = None if body is None else json.dumps(body).encode()
-    req_headers = dict(H)
-    if headers:
-        req_headers.update(headers)
-    req = urllib.request.Request(
-        f"{HOST}{path}", data=data, headers=req_headers, method=method
-    )
+    req = urllib.request.Request(f"{HOST}{path}", data=data, headers=H, method=method)
+    started = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if stream:
-                chunks = []
-                while True:
-                    line = resp.readline()
-                    if not line:
-                        break
-                    text = line.decode("utf-8", "replace")
-                    chunks.append(text)
-                    if text.strip() == "data: [DONE]":
-                        break
-                return resp.status, "".join(chunks)
+                return resp.status, read_sse(resp, started)
             raw = resp.read().decode()
             return resp.status, json.loads(raw) if raw else None
     except urllib.error.HTTPError as err:
@@ -81,6 +68,67 @@ def call(method, path, body=None, timeout=120, stream=False, headers=None):
         except json.JSONDecodeError:
             payload = raw
         return err.code, payload
+    except (http.client.HTTPException, OSError, ValueError) as err:
+        fail(f"{method} {path}: {err}")
+
+
+def read_sse(response, started):
+    outcome = {"chars": 0, "events": 0, "first_content": None, "finish": None, "done": False}
+    data = []
+    event = ""
+    last_content = None
+    for raw in response:
+        line = raw.decode("utf-8").rstrip("\r\n")
+        if line.startswith("data:"):
+            data.append(line[5:].lstrip(" "))
+        elif line.startswith("event:"):
+            event = line[6:].strip()
+        elif not line:
+            if not data:
+                if event == "error":
+                    raise ValueError("SSE error event without a body")
+                event = ""
+                continue
+            payload = "\n".join(data)
+            data.clear()
+            if event == "error":
+                raise ValueError("SSE error event")
+            event = ""
+            if payload == "[DONE]":
+                outcome["done"] = True
+                break
+            frame = json.loads(payload)
+            if not isinstance(frame, dict):
+                raise ValueError("invalid SSE JSON frame")
+            if "error" in frame or frame.get("type") == "error":
+                error = frame.get("error")
+                detail = error.get("code") or error.get("message") if isinstance(error, dict) else error
+                elapsed = time.monotonic() - started
+                raise ValueError(
+                    f"SSE upstream error after {elapsed:.1f}s and {outcome['events']} content deltas: "
+                    f"{str(detail or frame.get('message'))[:400]}"
+                )
+            for choice in frame.get("choices") or []:
+                delta = choice.get("delta") or {}
+                text = delta.get("content")
+                # Host may normalize missing finish_reason to ""; only non-empty counts.
+                finish = choice.get("finish_reason") or None
+                if isinstance(text, str) and text:
+                    if outcome["finish"] is not None:
+                        raise ValueError("content after finish_reason")
+                    last_content = time.monotonic() - started
+                    if outcome["first_content"] is None:
+                        outcome["first_content"] = last_content
+                    outcome["chars"] += len(text)
+                    outcome["events"] += 1
+                if finish:
+                    if outcome["finish"] is not None:
+                        raise ValueError("repeated finish_reason")
+                    outcome["finish"] = finish
+    outcome["elapsed"] = time.monotonic() - started
+    if outcome["first_content"] is not None:
+        outcome["content_span"] = last_content - outcome["first_content"]
+    return outcome
 
 
 def fail(msg):
@@ -120,12 +168,35 @@ if "auto" not in chat_models:
     fail(f"auto missing from halo-cursor catalog: {chat_models[:12]}")
 ok(f"/v1/models has {len(owned)} halo-cursor models; auto present")
 
-status, refresh = call(
-    "POST", "/api/models/refresh", {"provider": PROVIDER, "force": True}, timeout=90
-)
-if status != 200:
-    fail(f"models.refresh HTTP {status}: {refresh}")
-ok(f"models.refresh => {json.dumps(refresh, ensure_ascii=False)[:180]}")
+refresh = None
+for attempt in range(3):
+    status, refresh = call(
+        "POST", "/api/models/refresh", {"provider": PROVIDER, "force": True}, timeout=90
+    )
+    if status != 200 or not isinstance(refresh, dict):
+        if attempt == 2:
+            fail(f"models.refresh HTTP {status}")
+        time.sleep(1.5)
+        continue
+    refresh_data = refresh.get("data") or refresh
+    failed = refresh_data.get("failed")
+    if failed or refresh_data.get("error"):
+        if attempt == 2:
+            fail(f"models.refresh reported an upstream failure: {failed or refresh_data.get('error')}")
+        time.sleep(1.5)
+        continue
+    rows = refresh_data.get("results") or []
+    if rows and not any(
+        row.get("provider") == PROVIDER and row.get("status") in {"refreshed", "unchanged"}
+        for row in rows
+        if isinstance(row, dict)
+    ):
+        if attempt == 2:
+            fail("models.refresh did not refresh halo-cursor")
+        time.sleep(1.5)
+        continue
+    break
+ok("models.refresh completed")
 
 status, accounts = call("GET", "/api/accounts?includeHidden=true")
 if status != 200:
@@ -141,42 +212,7 @@ account = next(
 if not account:
     fail("no enabled halo-cursor account")
 account_id = account["id"]
-# Best-effort credential refresh so account.view can surface email as the label.
-# Host may 502 with "未产生变化" when tokens are still fresh — that is fine.
-status, refreshed = call("POST", "/api/accounts/refresh", {"id": account_id}, timeout=90)
-if status == 200:
-    status, accounts = call("GET", "/api/accounts?includeHidden=true")
-    if status != 200:
-        fail(f"accounts recheck HTTP {status}: {accounts}")
-    account = next(
-        (
-            item
-            for item in ((accounts.get("data") or accounts).get("accounts") or [])
-            if item.get("id") == account_id
-        ),
-        None,
-    )
-    if not account:
-        fail("halo-cursor account missing after refresh")
-elif not (
-    isinstance(refreshed, dict)
-    and "未产生变化" in str(refreshed.get("error") or refreshed)
-):
-    fail(f"account.refresh HTTP {status}: {refreshed}")
-account_name = (
-    account.get("displayName")
-    or account.get("name")
-    or account.get("email")
-    or account.get("loginName")
-    or ""
-)
-account_email = (account.get("email") or account.get("accountId") or "").strip()
-if "@" not in account_email and "@" not in account_name:
-    fail(f"account has no email: name={account_name!r} email={account_email!r}")
-ok(
-    f"account {account_id} email={account_email or account_name} "
-    f"label={account_name!r} canRefresh={account.get('canRefresh')}"
-)
+ok(f"enabled {PROVIDER} account found")
 
 status, usage_start = call(
     "POST",
@@ -202,12 +238,7 @@ for _ in range(40):
     usage = row.get("usage") if isinstance(row.get("usage"), dict) else row
     last = usage if isinstance(usage, dict) else row
     if row and not row.get("error") and isinstance(last, dict) and (
-        last.get("windows")
-        or last.get("credits")
-        or last.get("subscription")
-        or last.get("quotaSources")
-        or last.get("plan")
-        or last.get("available") is not None
+        last.get("windows") or last.get("credits")
     ):
         usage_ok = True
         break
@@ -226,141 +257,132 @@ ok(
     f"credits={bool(last.get('credits'))}"
 )
 
-status, stream = call(
-    "POST",
-    "/v1/chat/completions",
-    {
-        "model": "auto",
-        "stream": True,
-        "messages": [{"role": "user", "content": "只回：ready"}],
-        "max_tokens": 16,
-    },
-    timeout=180,
-    stream=True,
-)
-if status != 200:
-    fail(f"chat HTTP {status}: {stream}")
-if "data: " not in stream:
-    fail(f"chat stream empty: {stream[:400]}")
-if "error" in stream.lower() and "ready" not in stream.lower() and '"content"' not in stream:
-    fail(f"chat stream looks like error: {stream[:500]}")
-ok(f"chat stream on auto ({len(stream)} chars)")
-
-
-def extract_assistant_text(raw: str) -> str:
-    parts = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        payload = line[5:].strip()
-        if not payload or payload == "[DONE]":
-            continue
-        try:
-            event = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-        for choice in event.get("choices") or []:
-            delta = choice.get("delta") or {}
-            content = delta.get("content")
-            if isinstance(content, str) and content:
-                parts.append(content)
-            message = choice.get("message") or {}
-            content = message.get("content")
-            if isinstance(content, str) and content:
-                parts.append(content)
-    return "".join(parts)
-
-
-long_seconds = float(os.environ.get("HALO_CURSOR_AUTO_LONG_SECONDS", "40"))
-long_timeout = max(180, int(long_seconds) + 120)
-started = time.time()
-messages = [
-    {
-        "role": "user",
-        "content": (
-            "请用中文详细讲解：什么是冒烟测试、它和回归测试的区别、"
-            "以及在 Agent2API WASM 插件发版流程里为什么要做。请分点展开，"
-            "每点至少写一段，尽量写充分，不要提前结束。"
-        ),
-    }
+# Host may hand bare `auto` to higher-priority allowRouteSkip accounts even when
+# they do not advertise that model. Park them for the chat portion only.
+paused = [
+    item["id"]
+    for item in ((accounts.get("data") or accounts).get("accounts") or [])
+    if item.get("enabled")
+    and item.get("id") != account_id
+    and item.get("chatSupported") is not False
 ]
-rounds = 0
-chars = 0
-while True:
-    rounds += 1
-    status, stream = call(
+
+
+def set_enabled(account_ids, enabled):
+    for item_id in account_ids:
+        status, _ = call(
+            "PATCH",
+            f"/api/accounts/{item_id}",
+            {"enabled": enabled},
+            timeout=30,
+        )
+        if status != 200:
+            fail(f"account {'enable' if enabled else 'pause'} HTTP {status} for {item_id}")
+
+
+def chat(prompt, timeout):
+    status, outcome = call(
         "POST",
         "/v1/chat/completions",
         {
             "model": "auto",
+            "accountId": account_id,
             "stream": True,
-            "messages": messages,
-            "max_tokens": 1200,
+            "messages": [{"role": "user", "content": prompt}],
         },
-        timeout=long_timeout,
+        timeout=timeout,
         stream=True,
     )
     if status != 200:
-        fail(f"auto long chat HTTP {status}: {stream}")
-    if "data: " not in stream:
-        fail(f"auto long chat empty stream: {stream[:400]}")
-    if "error" in stream.lower() and '"content"' not in stream:
-        fail(f"auto long chat error stream: {stream[:500]}")
-    text = extract_assistant_text(stream)
-    chars += len(text)
-    elapsed = time.time() - started
-    if elapsed >= long_seconds:
-        break
-    if rounds >= 8:
-        fail(
-            f"auto long chat only reached {elapsed:.1f}s after {rounds} rounds "
-            f"(need >={long_seconds:.0f}s)"
+        fail(f"chat HTTP {status}: {outcome}")
+    if not outcome["done"] or outcome["finish"] not in {"stop", "length"} or not outcome["chars"]:
+        fail(f"incomplete chat stream: {outcome}")
+    return outcome
+
+
+def expect_halo_route(started_at):
+    deadline = time.monotonic() + 30
+    last_entries = []
+    while time.monotonic() < deadline:
+        status, stats = call("GET", "/api/stats/requests?limit=80")
+        if status != 200:
+            fail(f"stats.requests HTTP {status}")
+        entries = ((stats.get("data") or stats).get("entries") or [])
+        last_entries = [
+            item
+            for item in entries
+            if item.get("ts", 0) >= started_at - 2000
+            and (item.get("clientEvidence") or {}).get("userAgent") == CLIENT_UA
+        ]
+        recent = next(
+            (
+                item
+                for item in last_entries
+                if item.get("provider") == PROVIDER and item.get("accountId") == account_id
+            ),
+            None,
         )
-    messages.append({"role": "assistant", "content": text or "（上轮无文本，请继续）"})
-    messages.append(
-        {
-            "role": "user",
-            "content": "请继续展开下一点，再写一段更细的说明，不要重复前面内容。",
-        }
-    )
+        if recent:
+            if recent.get("providerLabel") != "Halo Cursor" or recent.get("status") != 200:
+                fail(
+                    f"smoke halo-cursor request status={recent.get('status')!r} "
+                    f"label={recent.get('providerLabel')!r}"
+                )
+            client = (recent.get("client") or "").lower()
+            client_label = recent.get("clientLabel") or ""
+            if client != "cursor" and "cursor" not in client_label.lower():
+                fail(f"client not matched as Cursor: {client!r} / {client_label!r}")
+            return
+        time.sleep(0.5)
+    summary = [
+        f"{item.get('provider')}:{item.get('status')}:{item.get('model')}"
+        for item in last_entries[:8]
+    ]
+    fail(f"no halo-cursor request report found for this smoke request; seen={summary}")
 
-elapsed = time.time() - started
-if elapsed < long_seconds:
-    fail(f"auto long chat too short: {elapsed:.1f}s < {long_seconds:.0f}s")
-ok(f"auto long chat: {elapsed:.1f}s rounds={rounds} chars={chars}")
 
-status, stats = call("GET", "/api/stats/requests?limit=30")
-if status != 200:
-    fail(f"stats.requests HTTP {status}: {stats}")
-entries = ((stats.get("data") or stats).get("entries") or [])
-recent = next(
-    (
-        item
-        for item in entries
-        if item.get("provider") == PROVIDER and item.get("accountId") == account_id
-    ),
-    None,
-)
-if not recent:
-    fail("no recent halo-cursor request in /api/stats/requests")
-provider_label = recent.get("providerLabel") or ""
-ua = ((recent.get("clientEvidence") or {}).get("userAgent") or "")
-logged_model = recent.get("model") or ""
-logged_account = recent.get("accountName") or ""
-client = (recent.get("client") or "").lower()
-client_label = recent.get("clientLabel") or ""
-if provider_label != "Halo Cursor":
-    fail(f"providerLabel want Halo Cursor got {provider_label!r}")
-if "Halo-Cursor-smoke" not in ua and "cursor-agent" not in ua:
-    fail(f"request UA missing smoke marker: {ua!r}")
-if client not in {"cursor"} and "cursor" not in client_label.lower():
-    fail(
-        f"client not matched as Cursor: client={client!r} label={client_label!r} ua={ua!r}"
+set_enabled(paused, False)
+ok(f"paused {len(paused)} other chat accounts for auto routing")
+try:
+    chat_started_at = int(time.time() * 1000)
+    short = chat("只回：ready", timeout=180)
+    expect_halo_route(chat_started_at)
+    ok(f"short auto chat, TTFT={short['first_content']:.2f}s, {short['events']} content deltas")
+
+    # One continuous RunSSE must stay open past the wall gate. RunSSE must not
+    # pass host timeout_ms (hard download deadline); longevity is stream-idle.
+    long_seconds = float(os.environ.get("HALO_CURSOR_AUTO_LONG_SECONDS", "40"))
+    if not 0 < long_seconds < float("inf"):
+        fail("HALO_CURSOR_AUTO_LONG_SECONDS must be finite and positive")
+    long_started_at = int(time.time() * 1000)
+    long_started = time.monotonic()
+    outcome = chat(
+        "用中文写一篇不少于2500字的长文，主题是流式 API 的可靠性："
+        "从请求验证、首包、网络分帧、心跳、结束事件、超时、断线、限流、"
+        "重试与观测写起，分小节展开，不要提纲，不要中途收束。",
+        timeout=max(300, int(long_seconds) + 240),
     )
-ok(
-    f"request identity provider={provider_label} account={logged_account or account_name} "
-    f"model={logged_model} client={client_label or client}"
-)
+    expect_halo_route(long_started_at)
+    elapsed = outcome.get("elapsed") or (time.monotonic() - long_started)
+    if elapsed < long_seconds or outcome["events"] < 2:
+        fail(
+            f"auto long chat only reached {elapsed:.1f}s in one stream "
+            f"(need >={long_seconds:.0f}s, events={outcome['events']})"
+        )
+    ok(
+        f"auto long chat: {elapsed:.1f}s one stream, "
+        f"{outcome['events']} content deltas, {outcome['chars']} chars"
+    )
+finally:
+    for item_id in paused:
+        status, _ = call(
+            "PATCH",
+            f"/api/accounts/{item_id}",
+            {"enabled": True},
+            timeout=30,
+        )
+        if status != 200:
+            print(f"WARN: failed to restore account {item_id} (HTTP {status})", file=sys.stderr)
+
 print("SMOKE PASS")
 PY

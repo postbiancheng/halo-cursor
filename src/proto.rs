@@ -66,6 +66,11 @@ pub struct Field {
 }
 
 pub fn fields(input: &[u8]) -> Vec<Field> {
+    checked_fields(input).unwrap_or_default()
+}
+
+pub fn checked_fields(input: &[u8]) -> Result<Vec<Field>, &'static str> {
+    const MALFORMED: &str = "Cursor Protobuf 字段无效";
     let mut out = Vec::new();
     let mut i = 0usize;
     let uv = |buf: &[u8], i: &mut usize| -> Option<u64> {
@@ -74,6 +79,9 @@ pub fn fields(input: &[u8]) -> Vec<Field> {
         while *i < buf.len() {
             let c = buf[*i];
             *i += 1;
+            if shift == 63 && c > 1 {
+                return None;
+            }
             value |= u64::from(c & 0x7f) << shift;
             if c < 0x80 {
                 return Some(value);
@@ -87,8 +95,11 @@ pub fn fields(input: &[u8]) -> Vec<Field> {
     };
     while i < input.len() {
         let Some(key) = uv(input, &mut i) else {
-            break;
+            return Err(MALFORMED);
         };
+        if !(1..=0x1fff_ffff).contains(&(key / 8)) {
+            return Err(MALFORMED);
+        }
         let num = (key / 8) as u32;
         let wire = (key % 8) as u8;
         let mut field = Field {
@@ -100,13 +111,13 @@ pub fn fields(input: &[u8]) -> Vec<Field> {
         match wire {
             0 => {
                 let Some(v) = uv(input, &mut i) else {
-                    break;
+                    return Err(MALFORMED);
                 };
                 field.n = v;
             }
             1 => {
                 if i + 8 > input.len() {
-                    break;
+                    return Err(MALFORMED);
                 }
                 field.data = input[i..i + 8].to_vec();
                 field.n = u64::from_le_bytes(input[i..i + 8].try_into().unwrap_or([0; 8]));
@@ -114,27 +125,30 @@ pub fn fields(input: &[u8]) -> Vec<Field> {
             }
             2 => {
                 let Some(len) = uv(input, &mut i) else {
-                    break;
+                    return Err(MALFORMED);
                 };
-                let len = len as usize;
-                if i + len > input.len() {
-                    break;
+                if len > (input.len() - i) as u64 {
+                    return Err(MALFORMED);
                 }
+                let len = len as usize;
                 field.data = input[i..i + len].to_vec();
                 i += len;
             }
             5 => {
                 if i + 4 > input.len() {
-                    break;
+                    return Err(MALFORMED);
                 }
                 field.n = u32::from_le_bytes(input[i..i + 4].try_into().unwrap_or([0; 4])) as u64;
                 i += 4;
             }
-            _ => break,
+            _ => return Err(MALFORMED),
+        }
+        if out.len() >= 16_384 {
+            return Err("Cursor Protobuf 字段数量超限");
         }
         out.push(field);
     }
-    out
+    Ok(out)
 }
 
 pub fn field<'a>(fs: &'a [Field], num: u32) -> Option<&'a Field> {
@@ -180,46 +194,51 @@ pub fn pb_value(value: &serde_json::Value) -> Vec<u8> {
     }
 }
 
-pub fn pb_any(data: &[u8]) -> serde_json::Value {
-    for f in fields(data) {
+pub fn pb_any(data: &[u8]) -> Option<serde_json::Value> {
+    pb_any_at_depth(data, 0)
+}
+
+fn pb_any_at_depth(data: &[u8], depth: usize) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    if depth >= 64 {
+        return None;
+    }
+    for f in checked_fields(data).ok()? {
         match f.num {
-            1 => return serde_json::Value::Null,
+            1 => return Some(Value::Null),
             2 => {
-                if f.data.len() == 8 {
-                    let bytes: [u8; 8] = f.data.as_slice().try_into().unwrap_or([0; 8]);
-                    return serde_json::json!(f64::from_le_bytes(bytes));
-                }
-                return serde_json::json!(0.0);
+                let bytes = f.data.as_slice().try_into().ok()?;
+                return Some(serde_json::json!(f64::from_le_bytes(bytes)));
             }
-            3 => return serde_json::Value::String(String::from_utf8_lossy(&f.data).into_owned()),
-            4 => return serde_json::json!(f.n != 0),
+            3 => return Some(Value::String(String::from_utf8(f.data).ok()?)),
+            4 => return Some(serde_json::json!(f.n != 0)),
             5 => {
                 let mut map = serde_json::Map::new();
-                for e in fields(&f.data) {
-                    if e.num != 1 {
-                        continue;
-                    }
-                    let kv = fields(&e.data);
-                    let key = pb_str(&kv, 1);
-                    let value = field(&kv, 2)
-                        .map(|v| pb_any(&v.data))
-                        .unwrap_or(serde_json::Value::Null);
-                    map.insert(key, value);
-                }
-                return serde_json::Value::Object(map);
-            }
-            6 => {
-                let items: Vec<_> = fields(&f.data)
+                for e in checked_fields(&f.data)
+                    .ok()?
                     .into_iter()
                     .filter(|e| e.num == 1)
-                    .map(|e| pb_any(&e.data))
-                    .collect();
-                return serde_json::Value::Array(items);
+                {
+                    let kv = checked_fields(&e.data).ok()?;
+                    let key = pb_str(&kv, 1);
+                    let value = pb_any_at_depth(&field(&kv, 2)?.data, depth + 1)?;
+                    map.insert(key, value);
+                }
+                return Some(Value::Object(map));
+            }
+            6 => {
+                let items = checked_fields(&f.data)
+                    .ok()?
+                    .into_iter()
+                    .filter(|e| e.num == 1)
+                    .map(|e| pb_any_at_depth(&e.data, depth + 1))
+                    .collect::<Option<Vec<_>>>()?;
+                return Some(Value::Array(items));
             }
             _ => {}
         }
     }
-    serde_json::Value::Null
+    None
 }
 
 pub fn frame(msg: &[u8]) -> Vec<u8> {
@@ -235,42 +254,76 @@ pub struct Frame {
     pub data: Vec<u8>,
 }
 
+const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
+
 pub struct FrameDecoder {
     buf: Vec<u8>,
+    encoding: String,
 }
 
 impl FrameDecoder {
-    pub fn new() -> Self {
-        Self { buf: Vec::new() }
+    pub fn new(encoding: &str) -> Self {
+        Self {
+            buf: Vec::new(),
+            encoding: encoding.to_ascii_lowercase(),
+        }
     }
 
-    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Frame>, String> {
+    pub fn has_partial_frame(&self) -> bool {
+        !self.buf.is_empty()
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Frame>, &'static str> {
+        use std::io::Read;
+
+        if self.buf.len().saturating_add(chunk.len()) > MAX_BATCH_BYTES {
+            return Err("Cursor Connect 输入缓冲超出大小限制");
+        }
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while self.buf.len() >= 5 {
-            let n = u32::from_be_bytes(self.buf[1..5].try_into().unwrap()) as usize;
-            if n > 64 << 20 {
-                return Err("malformed Connect stream".into());
+        let mut offset = 0;
+        let mut decoded_bytes = 0;
+        while let Some(header) = self.buf.get(offset..offset + 5) {
+            let flags = header[0];
+            if flags & !3 != 0 {
+                return Err("Cursor Connect 帧标志无效");
             }
-            if self.buf.len() < 5 + n {
+            let n = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+            if n > MAX_FRAME_BYTES {
+                return Err("Cursor Connect 帧超出大小限制");
+            }
+            let end = offset + 5 + n;
+            let Some(payload) = self.buf.get(offset + 5..end) else {
                 break;
-            }
-            let flags = self.buf[0];
-            let mut data = self.buf[5..5 + n].to_vec();
-            self.buf.drain(..5 + n);
-            if flags & 1 != 0 {
-                // gzip: WASM host rarely compresses; keep raw on failure
-                // Agent2API http sets accept-encoding: identity for RunSSE.
-            }
-            if flags & 1 != 0 {
-                // Ignore gzip bit if still compressed; Magpie gunzips. We request identity.
-                let _ = &mut data;
+            };
+            let data = if flags & 1 != 0 {
+                if self.encoding != "gzip" {
+                    return Err("Cursor Connect 帧使用了不支持的压缩方式");
+                }
+                let mut decoded = Vec::new();
+                flate2::read::MultiGzDecoder::new(payload)
+                    .take((MAX_FRAME_BYTES + 1) as u64)
+                    .read_to_end(&mut decoded)
+                    .map_err(|_| "Cursor Connect gzip 解压失败")?;
+                if decoded.len() > MAX_FRAME_BYTES {
+                    return Err("Cursor Connect 解压后帧超出大小限制");
+                }
+                decoded
+            } else {
+                payload.to_vec()
+            };
+            decoded_bytes += data.len() + 5;
+            if decoded_bytes > MAX_BATCH_BYTES || out.len() >= 16_384 {
+                return Err("Cursor Connect 帧批次超出大小限制");
             }
             out.push(Frame {
                 end: flags & 2 != 0,
                 data,
             });
+            offset = end;
         }
+        self.buf.drain(..offset);
         Ok(out)
     }
 }

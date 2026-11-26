@@ -20,6 +20,35 @@ fn put(snapshot: &state::Snapshot, value: Value, ttl: i64) -> Result<()> {
     }
 }
 
+pub(crate) fn anonymous_account_id(access: &str, api_key: Option<&str>) -> String {
+    let subject = client::session_user_id(access);
+    let (kind, seed) = if let Some(subject) = subject.as_deref() {
+        ("subject", subject)
+    } else if let Some(key) = api_key {
+        ("api-key", key)
+    } else {
+        ("token", access)
+    };
+    let digest = client::sha256_b64url(format!("halo-cursor/account/{kind}\0{seed}").as_bytes());
+    format!("cursor:{digest}")
+}
+
+pub(crate) fn public_account_id(secret: &Value) -> Value {
+    if secret["email"]
+        .as_str()
+        .is_some_and(|email| !email.trim().is_empty())
+    {
+        return secret["accountId"].clone();
+    }
+    if let Some(identity) = secret.get("publicAccountId").and_then(Value::as_str) {
+        return json!(identity);
+    }
+    match secret["accessToken"].as_str() {
+        Some(access) => json!(anonymous_account_id(access, secret["apiKey"].as_str())),
+        None => Value::Null,
+    }
+}
+
 fn secret_from_access(
     access: &str,
     refresh: Option<&str>,
@@ -29,7 +58,7 @@ fn secret_from_access(
     expires_at: i64,
 ) -> Value {
     let identity = if email.is_empty() {
-        format!("cursor:{}", &access[..access.len().min(24)])
+        anonymous_account_id(access, api_key)
     } else {
         format!("cursor:{email}")
     };
@@ -51,7 +80,12 @@ fn secret_from_access(
     secret
 }
 
-fn enrich(access: &str, refresh: Option<&str>, api_key: Option<&str>, expires_at: i64) -> Result<Value> {
+fn enrich(
+    access: &str,
+    refresh: Option<&str>,
+    api_key: Option<&str>,
+    expires_at: i64,
+) -> Result<Value> {
     let me = client::get_me(access).unwrap_or(Value::Null);
     let email = me["email"].as_str().unwrap_or("").trim().to_string();
     let plan = client::get_plan(access)
@@ -68,12 +102,7 @@ fn enrich(access: &str, refresh: Option<&str>, api_key: Option<&str>, expires_at
         client::jwt_exp_ms(access).unwrap_or_else(|| sdk::now().saturating_add(60 * 24 * 3600_000))
     };
     Ok(secret_from_access(
-        access,
-        refresh,
-        api_key,
-        &email,
-        &plan,
-        expires,
+        access, refresh, api_key, &email, &plan, expires,
     ))
 }
 
@@ -214,7 +243,9 @@ pub fn poll() -> Result<Value> {
         let errors = flow["errors"].as_i64().unwrap_or(0) + 1;
         if errors >= 3 {
             put(&reserved, Value::Null, 1000)?;
-            return Ok(json!({"state":"failed","message":format!("Cursor 授权失败：HTTP {status}")}));
+            return Ok(
+                json!({"state":"failed","message":format!("Cursor 授权失败：HTTP {status}")}),
+            );
         }
         flow["busy"] = json!(false);
         flow["errors"] = json!(errors);
@@ -232,8 +263,8 @@ pub fn poll() -> Result<Value> {
         return Err(Error::http(502, "Cursor 未返回 refresh token 字段"));
     }
     let refresh = body["refreshToken"].as_str();
-    let expires = client::jwt_exp_ms(access)
-        .unwrap_or_else(|| sdk::now().saturating_add(60 * 24 * 3600_000));
+    let expires =
+        client::jwt_exp_ms(access).unwrap_or_else(|| sdk::now().saturating_add(60 * 24 * 3600_000));
     let secret = enrich(access, refresh, None, expires)?;
     Ok(login::done(super::normalized(secret)))
 }
@@ -283,22 +314,38 @@ pub fn credentials(force: bool) -> Result<Value> {
         .as_str()
         .ok_or_else(|| Error::http(401, "请重新导入 Cursor API Key"))?;
     let (access, expires) = client::exchange_api_key(api_key)?;
-    let new = enrich(access.as_str(), None, Some(api_key), expires)?;
-    if new["identity"] != current["identity"]
-        && !current["email"].as_str().unwrap_or("").is_empty()
-        && !new["email"].as_str().unwrap_or("").is_empty()
-        && new["email"] != current["email"]
-    {
-        return Err(Error::http(409, "Cursor 账号身份已变化"));
+    let old_subject = current["accessToken"]
+        .as_str()
+        .and_then(client::session_user_id);
+    let new_subject = client::session_user_id(&access);
+    if let (Some(old), Some(new)) = (old_subject, new_subject) {
+        if old != new {
+            return Err(Error::http(409, "Cursor 账号身份已变化"));
+        }
     }
+    if expires <= sdk::now() {
+        return Err(Error::http(401, "Cursor 返回了已过期的凭据"));
+    }
+    let mut new = current.clone();
+    new["publicAccountId"] = public_account_id(current);
+    new["accessToken"] = json!(access);
+    new["expiresAt"] = json!(expires);
     let saved = sdk::host(
         "account.update",
         json!({"expect": current, "secret": new, "public": super::public(&new)}),
     )?;
-    if saved["updated"] != true {
-        return Err(Error::http(409, "保存 Cursor 续期凭据失败"));
+    if saved["updated"] == true {
+        return Ok(new);
     }
-    Ok(new)
+    let latest = sdk::account()?;
+    let replacement = &latest["secret"];
+    if replacement["identity"] == current["identity"]
+        && replacement["accessToken"] != current["accessToken"]
+        && !due(replacement, 0)
+    {
+        return Ok(replacement.clone());
+    }
+    Err(Error::http(409, "保存 Cursor 续期凭据时账号已变化"))
 }
 
 pub fn normalize_api_key(api_key: &str) -> Result<Value> {
@@ -308,4 +355,23 @@ pub fn normalize_api_key(api_key: &str) -> Result<Value> {
     }
     let (access, expires) = client::exchange_api_key(key)?;
     enrich(&access, None, Some(key), expires)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anonymous_public_ids_hide_old_token_prefix_and_survive_api_key_exchange() {
+        let legacy = json!({
+            "accessToken": "test-old-bearer-token",
+            "apiKey": "test-account-key",
+            "accountId": "cursor:test-old-bearer-token"
+        });
+        let renewed = json!({"accessToken":"test-new-bearer-token", "apiKey":"test-account-key"});
+        let public_id = public_account_id(&legacy);
+        assert_eq!(public_id, public_account_id(&renewed));
+        assert_ne!(public_id, legacy["accountId"]);
+        assert!(!public_id.as_str().unwrap().contains("test-account-key"));
+    }
 }

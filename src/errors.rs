@@ -1,6 +1,6 @@
 //! Cursor upstream error classification for the Agent2API host.
 
-use agent2api_wasm_sdk::{self as sdk, json, Value};
+use agent2api_wasm_sdk::{self as sdk, http, json, Error, Result, Value};
 
 fn detail_from_connect(body: &Value) -> Option<String> {
     // Magpie: Connect errors often put the useful text under details[].debug.details.
@@ -59,12 +59,7 @@ fn message(body: &Value) -> String {
         })
         .or_else(|| {
             // Fall back to bare "Error" only when nothing better exists.
-            [
-                "/error/message",
-                "/message",
-            ]
-            .iter()
-            .find_map(|path| {
+            ["/error/message", "/message"].iter().find_map(|path| {
                 body.pointer(path)
                     .and_then(Value::as_str)
                     .map(str::trim)
@@ -72,7 +67,12 @@ fn message(body: &Value) -> String {
                     .map(str::to_string)
             })
         })
-        .or_else(|| body.as_str().map(str::trim).filter(|text| !text.is_empty()).map(str::to_string))
+        .or_else(|| {
+            body.as_str()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| "Cursor 上游未返回错误说明".into())
 }
 
@@ -84,9 +84,98 @@ fn code_text(body: &Value) -> String {
     ]
     .into_iter()
     .flatten()
-    .find_map(|value| value.as_str().map(str::trim).filter(|text| !text.is_empty()))
+    .find_map(|value| {
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    })
     .unwrap_or("")
     .to_ascii_lowercase()
+}
+
+fn retry_after(header: &str) -> Option<i64> {
+    let header = header.trim();
+    let now = sdk::now();
+    header
+        .parse::<i64>()
+        .ok()
+        .filter(|seconds| *seconds >= 0)
+        .map(|seconds| now.saturating_add(seconds.saturating_mul(1_000)))
+        .or_else(|| {
+            chrono::DateTime::parse_from_rfc2822(header)
+                .ok()
+                .map(|date| date.timestamp_millis())
+        })
+        .filter(|time| *time >= now)
+}
+
+fn max_mode_required(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    (lower.contains("max mode") && lower.contains("required")) || lower.contains("请开启 max mode")
+}
+
+pub fn http_response(operation: &str, response: http::Response) -> Error {
+    let status = response.status;
+    let reset = response
+        .header_values("Retry-After")
+        .into_iter()
+        .find_map(retry_after);
+    let body = match response.bytes(256 << 10) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({"message": String::from_utf8_lossy(&bytes)})),
+        Err(error) => json!({ "message": error.message }),
+    };
+    upstream_error(operation, status, &body, reset)
+}
+
+pub fn connect_end(bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let body: Value = serde_json::from_slice(bytes)
+        .map_err(|_| Error::http(502, "Cursor Connect 结束帧不是有效 JSON"))?;
+    if !body.is_object() {
+        return Err(Error::http(502, "Cursor Connect 结束帧格式无效"));
+    }
+    if body.get("error").is_some() || body.get("code").is_some() {
+        let reset = body["metadata"]
+            .as_object()
+            .into_iter()
+            .flat_map(|headers| headers.iter())
+            .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
+            .and_then(|(_, values)| values.as_array())
+            .and_then(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .find_map(retry_after)
+            });
+        return Err(upstream_error("RunSSE", 200, &body, reset));
+    }
+    Ok(())
+}
+
+fn upstream_error(operation: &str, status: u16, body: &Value, reset: Option<i64>) -> Error {
+    let class = classify(status, body);
+    let classified = class["status"].as_u64().unwrap_or(502) as u16;
+    let detail: String = class["message"]
+        .as_str()
+        .unwrap_or("Cursor 请求失败")
+        .chars()
+        .take(512)
+        .collect();
+    let kind = class["kind"].as_str().unwrap_or("fatal");
+    let code = if matches!(kind, "fatal" | "request_invalid" | "capacity")
+        && max_mode_required(&message(body))
+    {
+        "cursor_max_mode_required".into()
+    } else {
+        format!("cursor_{kind}")
+    };
+    Error::http(classified, format!("Cursor {operation}：{detail}"))
+        .with_code(code)
+        .with_reset(reset)
 }
 
 pub fn classify(status: u16, body: &Value) -> Value {
@@ -96,8 +185,22 @@ pub fn classify(status: u16, body: &Value) -> Value {
     let failed = if (400..600).contains(&status) {
         status
     } else {
-        502
+        match code.as_str() {
+            "invalid_argument" | "failed_precondition" | "out_of_range" => 400,
+            "permission_denied" => 403,
+            "not_found" => 404,
+            "unavailable" => 503,
+            "deadline_exceeded" => 504,
+            _ => 502,
+        }
     };
+
+    if code == "cursor_partial_stream" || raw.contains("Cursor 流已输出后中断") {
+        return json!({"kind":"partial_stream","status":failed,"message":raw});
+    }
+    if code == "cursor_append_unconfirmed" || raw.contains("Cursor BidiAppend 确认失败") {
+        return json!({"kind":"append_unconfirmed","status":failed,"message":raw});
+    }
 
     if status == 401
         || matches!(
@@ -107,8 +210,7 @@ pub fn classify(status: u16, body: &Value) -> Value {
         || lower.contains("sign in")
         || lower.contains("unauthorized")
         || lower.contains("unauthenticated")
-        || lower.contains("access token")
-            && (lower.contains("expir") || lower.contains("invalid"))
+        || lower.contains("access token") && (lower.contains("expir") || lower.contains("invalid"))
     {
         return json!({
             "kind": "token_expired",
@@ -124,54 +226,40 @@ pub fn classify(status: u16, body: &Value) -> Value {
         || lower.contains("please update")
     {
         return json!({
-            "kind": "fatal",
+            "kind": "client_version",
             "status": failed,
             "message": format!("Cursor 要求更新客户端版本：{raw}"),
             "upstream_code": code,
         });
     }
 
-    // Bare Connect `{code:resource_exhausted,message:Error}` is often a model /
-    // capacity failure, not a spend-limit window — keep those as fatal.
-    let generic_exhausted = code == "resource_exhausted"
-        && (raw.eq_ignore_ascii_case("error") || raw.is_empty() || raw == "Error");
-    let quota = !generic_exhausted
-        && (status == 429
-            || matches!(
-                code.as_str(),
-                "resource_exhausted" | "rate_limit_exceeded" | "usage_limit" | "quota_exceeded"
-            )
-            || [
-                "rate limit",
-                "usage limit",
-                "quota",
-                "too many requests",
-                "budget limit",
-                "额度",
-                "用量已用完",
-            ]
-            .iter()
-            .any(|part| lower.contains(part)));
-
-    if quota {
+    let contains_any = |parts: &[&str]| parts.iter().any(|part| lower.contains(part));
+    let quota = matches!(code.as_str(), "usage_limit" | "quota_exceeded")
+        || contains_any(&[
+            "usage limit",
+            "quota",
+            "budget limit",
+            "spend limit",
+            "额度",
+            "用量已用完",
+        ]);
+    let rate = status == 429
+        || code == "rate_limit_exceeded"
+        || contains_any(&["rate limit", "too many requests"]);
+    let overloaded = (code == "resource_exhausted" && !quota && !rate)
+        || contains_any(&["model is overloaded", "at capacity", "capacity exhausted"]);
+    if quota || rate || overloaded {
         return json!({
-            "kind": "quota_limited",
-            "status": 429,
+            "kind": if quota { "quota_limited" } else if rate { "rate_limited" } else { "capacity" },
+            "status": if overloaded { 503 } else { 429 },
             "message": format!("Cursor 上游限制：{raw}"),
             "upstream_code": code,
-            "reset_at": sdk::now().saturating_add(60_000),
         });
     }
 
-    let blocked = [
-        "content",
-        "safety",
-        "refused to serve",
-        "policy",
-        "blocked",
-    ]
-    .iter()
-    .any(|part| lower.contains(part))
+    let blocked = ["content", "safety", "refused to serve", "policy", "blocked"]
+        .iter()
+        .any(|part| lower.contains(part))
         && (lower.contains("refus")
             || lower.contains("block")
             || lower.contains("policy")
@@ -192,26 +280,43 @@ pub fn classify(status: u16, body: &Value) -> Value {
         format!("{code}: {raw}")
     };
     json!({
-        "kind": "fatal",
+        "kind": if matches!(failed, 400 | 403 | 404 | 413 | 422) { "request_invalid" } else { "fatal" },
         "status": failed,
         "message": format!("Cursor 上游请求失败：{detail}"),
         "upstream_code": code,
     })
 }
 
+fn reported_code(params: &Value) -> &str {
+    params["code"]
+        .as_str()
+        .or_else(|| params.pointer("/error/code").and_then(Value::as_str))
+        .or_else(|| params.pointer("/body/error/code").and_then(Value::as_str))
+        .or_else(|| params.pointer("/body/code").and_then(Value::as_str))
+        .unwrap_or_default()
+}
+
 pub fn policy(status: u16, body: &Value) -> Value {
     let class = classify(status, body);
     let kind = class["kind"].as_str().unwrap_or("fatal");
+    let stopped = matches!(
+        code_text(body).as_str(),
+        "cursor_partial_stream" | "cursor_append_unconfirmed"
+    );
     json!({
-        "stop": matches!(kind, "token_expired" | "content_blocked"),
+        "stop": stopped || matches!(kind, "token_expired" | "content_blocked" | "request_invalid" | "client_version" | "partial_stream" | "append_unconfirmed"),
         "kind": kind,
     })
 }
 
 pub fn retry(params: &Value) -> Value {
     let attempt = params["attempt"].as_u64().unwrap_or(0);
-    let budget = params["budget"].as_u64().unwrap_or(0);
-    if budget > 0 && attempt >= budget {
+    let budget = params["budget"]
+        .as_u64()
+        .filter(|budget| *budget > 0)
+        .unwrap_or(2)
+        .min(2);
+    if attempt >= budget {
         return json!({ "action": "stop", "reason": "已达到重试上限" });
     }
     let status = params["status"]
@@ -219,23 +324,63 @@ pub fn retry(params: &Value) -> Value {
         .and_then(|value| u16::try_from(value).ok())
         .unwrap_or(502);
     let class = classify(status, &params["body"]);
-    match class["kind"].as_str().unwrap_or("fatal") {
-        "token_expired" | "content_blocked" => json!({
-            "action": "stop",
-            "reason": class["message"].as_str().unwrap_or("不可重试的上游错误"),
-        }),
-        "quota_limited" => json!({
-            "action": "retry",
-            "delay_ms": 10_000u64,
-            "reason": "Cursor 限流或额度窗口，等待后重试",
-        }),
-        _ if matches!(status, 408 | 425 | 500 | 502 | 503 | 504) => json!({
-            "action": "retry",
-            "delay_ms": 2_000u64.saturating_mul(attempt.saturating_add(1).min(5)),
-            "reason": "Cursor 上游暂时失败，短暂重试",
-        }),
-        _ => json!({ "action": "default" }),
+    let code = reported_code(params);
+    let kind = match code {
+        "cursor_quota_limited" => "quota_limited",
+        "cursor_rate_limited" => "rate_limited",
+        "cursor_capacity" => "capacity",
+        _ => class["kind"].as_str().unwrap_or("fatal"),
+    };
+    if matches!(
+        code,
+        "cursor_partial_stream"
+            | "cursor_append_unconfirmed"
+            | "cursor_max_mode_required"
+            | "cursor_client_version"
+    ) || matches!(
+        kind,
+        "token_expired"
+            | "content_blocked"
+            | "quota_limited"
+            | "request_invalid"
+            | "client_version"
+            | "partial_stream"
+            | "append_unconfirmed"
+    ) {
+        return json!({ "action": "stop", "reason": "当前请求不可直接重试" });
     }
+    if !matches!(kind, "rate_limited" | "capacity")
+        && !matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
+    {
+        return json!({ "action": "default" });
+    }
+    let now = sdk::now();
+    let reset = params["resetAt"]
+        .as_i64()
+        .or_else(|| params["reset_at"].as_i64())
+        .or_else(|| params.pointer("/error/reset_at").and_then(Value::as_i64))
+        .or_else(|| params.pointer("/body/reset_at").and_then(Value::as_i64))
+        .or_else(|| {
+            params
+                .pointer("/body/error/reset_at")
+                .and_then(Value::as_i64)
+        });
+    let delay = reset
+        .map(|at| at.saturating_sub(now))
+        .filter(|delay| *delay > 0);
+    if delay.is_some_and(|delay| delay > 30_000) {
+        return json!({"action":"stop","reason":"上游要求等待超过当前请求的重试预算"});
+    }
+    let jitter = super::client::random_bytes(2)
+        .ok()
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]) as u64 % 500)
+        .unwrap_or(0);
+    let base = if kind == "rate_limited" { 5_000 } else { 1_000 };
+    let delay = delay
+        .map(|delay| delay as u64)
+        .unwrap_or(base * (1 << attempt))
+        + jitter;
+    json!({ "action": "retry", "delay_ms": delay, "reason": "Cursor 上游暂时失败，退避后重试" })
 }
 
 pub fn advice(params: &Value) -> Value {
@@ -262,18 +407,18 @@ mod tests {
         );
         assert_eq!(auth["kind"], "token_expired");
 
-        let quota = classify(
+        let rate = classify(
             429,
             &json!({"error":{"message":"Rate limit exceeded","code":"rate_limit_exceeded"}}),
         );
-        assert_eq!(quota["kind"], "quota_limited");
+        assert_eq!(rate["kind"], "rate_limited");
 
         let opaque = classify(
             200,
             &json!({"error":{"message":"Error","code":"resource_exhausted"}}),
         );
-        assert_eq!(opaque["kind"], "fatal");
-        assert!(opaque["message"].as_str().unwrap().contains("resource_exhausted"));
+        assert_eq!(opaque["kind"], "capacity");
+        assert_eq!(opaque["upstream_code"], "resource_exhausted");
 
         let stale = classify(
             200,
@@ -292,7 +437,7 @@ mod tests {
                 }
             }),
         );
-        assert_eq!(stale["kind"], "fatal");
+        assert_eq!(stale["kind"], "client_version");
         assert!(stale["message"].as_str().unwrap().contains("更新客户端"));
 
         let blocked = classify(
@@ -303,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_stops_on_auth_and_waits_on_quota() {
+    fn retry_distinguishes_quota_rate_limit_and_partial_stream() {
         let stop = retry(&json!({
             "attempt": 0,
             "budget": 3,
@@ -312,13 +457,16 @@ mod tests {
         }));
         assert_eq!(stop["action"], "stop");
 
-        let wait = retry(&json!({
-            "attempt": 1,
-            "budget": 3,
-            "status": 429,
-            "body": {"message":"usage limit"}
-        }));
+        let quota = retry(&json!({"status":429,"body":{"message":"usage limit"}}));
+        assert_eq!(quota["action"], "stop");
+        let wait = retry(&json!({"status":429,"attempt":1,"resetAt":12_000}));
         assert_eq!(wait["action"], "retry");
-        assert_eq!(wait["delay_ms"], 10_000);
+        assert_eq!(wait["delay_ms"], 12_000);
+        let limit = retry(&json!({"status":503,"attempt":2,"budget":10}));
+        assert_eq!(limit["action"], "stop");
+        for code in ["cursor_partial_stream", "cursor_append_unconfirmed"] {
+            let decision = retry(&json!({"status":502,"body":{"error":{"code":code}}}));
+            assert_eq!(decision["action"], "stop");
+        }
     }
 }

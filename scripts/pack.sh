@@ -30,7 +30,7 @@ else
   CARGO="cargo"
 fi
 
-"$CARGO" build --release --target wasm32-unknown-unknown
+"$CARGO" build --locked --release --target wasm32-unknown-unknown
 
 mkdir -p "$OUT_DIR"
 cp -f "$WASM_SRC" "$WASM_DST"
@@ -38,7 +38,23 @@ cp -f pack.json wasm.json "$OUT_DIR/"
 rm -rf "${OUT_DIR}/assets"
 cp -R assets "${OUT_DIR}/assets"
 
-(cd "$OUT_DIR" && zip -q -X -r "$(basename "$ZIP")" pack.json wasm.json halo-cursor.wasm assets)
+PACK_TMP="$(mktemp -d "${OUT_DIR}/.pack.XXXXXX")"
+trap 'rm -rf "$PACK_TMP"' EXIT
+(cd "$OUT_DIR" && zip -q -X -r "$PACK_TMP/$(basename "$ZIP")" pack.json wasm.json halo-cursor.wasm assets)
+mv -f "$PACK_TMP/$(basename "$ZIP")" "$ZIP"
+(
+  cd "$OUT_DIR"
+  shasum -a 256 "$(basename "$ZIP")" > "$(basename "$ZIP").sha256"
+)
+{
+  printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
+  if [[ -n "$(git status --porcelain)" ]]; then
+    printf 'worktree=dirty\n'
+  else
+    printf 'worktree=clean\n'
+  fi
+  printf 'wasm_sha256=%s\n' "$(shasum -a 256 "$WASM_DST" | awk '{print $1}')"
+} > "${ZIP}.build-info"
 
 echo "built: $ZIP"
 ls -lh "$ZIP" "$WASM_DST"

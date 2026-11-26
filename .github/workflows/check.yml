@@ -1,0 +1,21 @@
+name: Check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo test --locked
+      - run: cargo build --locked --release --target wasm32-unknown-unknown
+      - run: node --test tests/forward-wasm.mjs
+      - run: |
+          bash -n scripts/pack.sh
+          bash -n scripts/smoke-local.sh

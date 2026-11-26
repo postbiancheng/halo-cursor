@@ -15,9 +15,13 @@ pub fn random_bytes(len: usize) -> Result<Vec<u8>> {
     let encoded = raw
         .as_str()
         .ok_or_else(|| Error::http(502, "随机数宿主接口返回无效"))?;
-    base64::engine::general_purpose::STANDARD
+    let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
-        .map_err(|_| Error::http(502, "随机数解码失败"))
+        .map_err(|_| Error::http(502, "随机数解码失败"))?;
+    if bytes.len() != len {
+        return Err(Error::http(502, "随机数宿主接口返回长度无效"));
+    }
+    Ok(bytes)
 }
 
 pub fn uuid_v4() -> Result<String> {
@@ -76,13 +80,17 @@ pub fn unary(path: &str, token: &str, body: Value) -> Result<Value> {
 
 pub fn unary_timeout(path: &str, token: &str, body: Value, timeout_ms: u64) -> Result<Value> {
     let url = format!("{API}/{path}");
-    let response = http::open_timeout("POST", &url, headers(Some(token))?, Some(&body), timeout_ms)?;
+    let response =
+        http::open_timeout("POST", &url, headers(Some(token))?, Some(&body), timeout_ms)?;
     let status = response.status;
     if !(200..300).contains(&status) {
         let text = String::from_utf8_lossy(&response.bytes(1 << 20)?).into_owned();
         return Err(Error::http(
             status,
-            format!("Cursor {path} 失败：{}", text.chars().take(240).collect::<String>()),
+            format!(
+                "Cursor {path} 失败：{}",
+                text.chars().take(240).collect::<String>()
+            ),
         ));
     }
     response.json()
@@ -222,6 +230,7 @@ pub fn exchange_api_key(api_key: &str) -> Result<(String, i64)> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| Error::http(401, "Cursor 未返回 access token"))?
         .to_string();
-    let expires = jwt_exp_ms(&access).unwrap_or_else(|| sdk::now().saturating_add(30 * 24 * 3600_000));
+    let expires =
+        jwt_exp_ms(&access).unwrap_or_else(|| sdk::now().saturating_add(30 * 24 * 3600_000));
     Ok((access, expires))
 }

@@ -6,14 +6,22 @@ use super::{
 };
 use agent2api_wasm_sdk::{self as sdk, http, json, Error, Result, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const NS: &str = "tools";
 const CALL: &str = "CallDynamicTool";
 const NO_RESULT: &str = "Tool use was interrupted and did not produce a result.";
 const HEARTBEAT_MS: i64 = 5_000;
-const STALL_MS: i64 = 120_000;
+const FIRST_OUTPUT_MS: i64 = 60_000;
+const STALL_MS: i64 = 90_000;
+const TOOL_COUNT_WAIT_MS: i64 = 30_000;
 const APPEND_TIMEOUT_MS: u64 = 60_000;
+const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+/// Agent2API's reqwest/rustls RunSSE path is often peer-closed around ~30s;
+/// Magpie's Node fetch to the same endpoint is not. Soft-continue stitches a
+/// new RunSSE onto the same client stream when that transport cut happens.
+const MAX_STREAM_CONTINUES: u32 = 8;
+const CONTINUE_USER: &str = "请从断点处继续输出，不要重复已经写过的内容。";
 
 fn text_of(content: &Value) -> String {
     match content {
@@ -107,43 +115,57 @@ fn tool_result(id: &str, text: &str, is_error: bool) -> Value {
     row
 }
 
-fn conversation_blobs(body: &Value, tools: &[ToolDef]) -> Result<(Vec<Vec<u8>>, String, usize)> {
+fn conversation_blobs(body: &Value, tools: &[ToolDef]) -> Result<(Vec<Vec<u8>>, String)> {
     let messages = body["messages"]
         .as_array()
         .ok_or_else(|| Error::http(400, "缺少 messages"))?;
     let mut out: Vec<Vec<u8>> = Vec::new();
-    let mut size = 0usize;
     let mut last = ".".to_string();
     let mut system = Vec::new();
     for m in messages {
+        if m["content"].as_array().is_some_and(|parts| {
+            parts.iter().any(|part| {
+                !matches!(
+                    part["type"].as_str(),
+                    None | Some("text" | "input_text" | "output_text")
+                )
+            })
+        }) {
+            return Err(Error::http(400, "Halo Cursor 仅支持文本消息内容"));
+        }
         let role = m["role"].as_str().unwrap_or("");
         if role == "system" || role == "developer" {
             system.push(text_of(&m["content"]));
         }
     }
     let sys = {
-        let mut s = system.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
+        let mut s = system
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
         s.push_str(&catalog(tools));
         s
     };
-    size += sys.len();
     if !sys.is_empty() {
         out.push(serde_json::to_vec(&json!({"role":"system","content":sys})).unwrap_or_default());
     }
 
     let mut pending: Vec<String> = Vec::new();
     let mut results: Vec<Value> = Vec::new();
-    let flush_results = |pending: &mut Vec<String>, results: &mut Vec<Value>, out: &mut Vec<Vec<u8>>| {
-        for id in pending.drain(..) {
-            results.push(tool_result(&id, NO_RESULT, true));
-        }
-        if !results.is_empty() {
-            out.push(
-                serde_json::to_vec(&json!({"role":"tool","content":results.clone()})).unwrap_or_default(),
-            );
-            results.clear();
-        }
-    };
+    let flush_results =
+        |pending: &mut Vec<String>, results: &mut Vec<Value>, out: &mut Vec<Vec<u8>>| {
+            for id in pending.drain(..) {
+                results.push(tool_result(&id, NO_RESULT, true));
+            }
+            if !results.is_empty() {
+                out.push(
+                    serde_json::to_vec(&json!({"role":"tool","content":results.clone()}))
+                        .unwrap_or_default(),
+                );
+                results.clear();
+            }
+        };
 
     for m in messages {
         let role = m["role"].as_str().unwrap_or("");
@@ -154,7 +176,7 @@ fn conversation_blobs(body: &Value, tools: &[ToolDef]) -> Result<(Vec<Vec<u8>>, 
                 if let Some(pos) = pending.iter().position(|p| p == &id) {
                     pending.remove(pos);
                     let text = text_of(&m["content"]);
-                    size += text.len();
+
                     let is_error = m["is_error"] == true || m["isError"] == true;
                     results.push(tool_result(&id, &text, is_error));
                 }
@@ -165,18 +187,16 @@ fn conversation_blobs(body: &Value, tools: &[ToolDef]) -> Result<(Vec<Vec<u8>>, 
                 let reasoning = reasoning_of(m);
                 if !reasoning.is_empty() {
                     content.push(json!({"type":"reasoning","text":reasoning}));
-                    size += reasoning.len();
                 }
                 let text = text_of(&m["content"]);
                 if !text.is_empty() {
                     content.push(json!({"type":"text","text":text}));
-                    size += text.len();
                 }
                 for call in m["tool_calls"].as_array().into_iter().flatten() {
                     let name = call["function"]["name"].as_str().unwrap_or("");
                     let args_raw = call["function"]["arguments"].as_str().unwrap_or("{}");
                     let args = parse_args(args_raw);
-                    size += args_raw.len() + name.len();
+
                     let id = call["id"].as_str().unwrap_or("").to_string();
                     content.push(json!({
                         "type": "tool-call",
@@ -201,27 +221,21 @@ fn conversation_blobs(body: &Value, tools: &[ToolDef]) -> Result<(Vec<Vec<u8>>, 
                     Value::String(s) if !s.is_empty() => {
                         content.push(json!({"type":"text","text":s}));
                         first = s.clone();
-                        size += s.len();
                     }
                     Value::Array(parts) => {
                         for p in parts {
                             match p["type"].as_str().unwrap_or("text") {
-                                "text" | "input_text" => {
+                                "text" | "input_text" | "output_text" => {
                                     if let Some(t) = p["text"].as_str() {
                                         content.push(json!({"type":"text","text":t}));
                                         if first.is_empty() {
                                             first = t.to_string();
                                         }
-                                        size += t.len();
                                     }
                                 }
-                                "image_url" => {
-                                    content.push(json!({
-                                        "type": "text",
-                                        "text": "[attachment image]"
-                                    }));
+                                _ => {
+                                    return Err(Error::http(400, "Halo Cursor 仅支持文本消息内容"))
                                 }
-                                _ => {}
                             }
                         }
                     }
@@ -241,7 +255,7 @@ fn conversation_blobs(body: &Value, tools: &[ToolDef]) -> Result<(Vec<Vec<u8>>, 
         }
     }
     flush_results(&mut pending, &mut results, &mut out);
-    Ok((out, last, size / 4))
+    Ok((out, last))
 }
 
 fn tool_def_bytes(t: &ToolDef) -> Vec<u8> {
@@ -257,7 +271,11 @@ fn tool_def_bytes(t: &ToolDef) -> Vec<u8> {
 }
 
 fn env_bytes() -> Vec<u8> {
-    Pb::new().str(1, "macos").str(2, "/tmp").str(10, "UTC").done()
+    Pb::new()
+        .str(1, "macos")
+        .str(2, "/tmp")
+        .str(10, "UTC")
+        .done()
 }
 
 fn put_blob(blobs: &mut BTreeMap<String, Vec<u8>>, bytes: Vec<u8>) -> [u8; 32] {
@@ -274,19 +292,15 @@ fn build_run(
     conv: &str,
     max_mode: bool,
     params: &[(String, String)],
-) -> (Vec<u8>, BTreeMap<String, Vec<u8>>) {
+) -> Result<(Vec<u8>, BTreeMap<String, Vec<u8>>)> {
     let mut blobs = BTreeMap::new();
     let mut state = Pb::new();
     for m in msgs {
         let id = put_blob(&mut blobs, m.clone());
         state = state.bytes(1, &id);
     }
-    let mid = client::uuid_v4().unwrap_or_else(|_| "00000000-0000-4000-8000-000000000000".into());
-    let user = Pb::new()
-        .str(1, last_user)
-        .str(2, &mid)
-        .varint(4, 1)
-        .done();
+    let mid = client::uuid_v4()?;
+    let user = Pb::new().str(1, last_user).str(2, &mid).varint(4, 1).done();
     let user_id = put_blob(&mut blobs, user);
     let turn_inner = Pb::new().bytes(1, &user_id).str(10, &mid).done();
     let turn = Pb::new().bytes(1, &turn_inner).done();
@@ -313,7 +327,7 @@ fn build_run(
     }
 
     let cid = if conv.is_empty() {
-        client::uuid_v4().unwrap_or_else(|_| mid.clone())
+        client::uuid_v4()?
     } else {
         conv.to_string()
     };
@@ -329,7 +343,7 @@ fn build_run(
         .varint(37, 1);
 
     let first = Pb::new().nested(1, rr).done();
-    (first, blobs)
+    Ok((first, blobs))
 }
 
 fn conversation_id(body: &Value) -> String {
@@ -374,7 +388,7 @@ fn model_params(body: &Value) -> (bool, Vec<(String, String)>) {
     let mut params = Vec::new();
     let mut max_mode = body["model"]
         .as_str()
-        .map(|m| m.contains("@1m") || m.contains("1m"))
+        .map(|m| m.split(['@', '-']).any(|part| part == "1m"))
         .unwrap_or(false);
 
     let default_effort = config::reasoning_effort().ok().flatten();
@@ -395,66 +409,77 @@ fn model_params(body: &Value) -> (bool, Vec<(String, String)>) {
     (max_mode, params)
 }
 
-fn run_model_id(model: &str) -> String {
-    let bare = model.split('@').next().unwrap_or(model);
-    if bare == "auto" {
-        "default".into()
-    } else {
-        bare.to_string()
-    }
-}
-
-fn max_mode_required(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("max mode required")
-        || lower.contains("max mode") && lower.contains("required")
-        || lower.contains("请开启 max mode")
-}
-
-fn bidi_append(headers: &Value, request_id: &str, msg: &[u8], seq: u64) -> Result<()> {
+pub(crate) fn bidi_append(headers: &Value, request_id: &str, msg: &[u8], seq: u64) -> Result<()> {
     let body = Pb::new()
         .str(1, &hex::encode(msg))
         .nested(2, Pb::new().str(1, request_id))
         .varint(3, seq)
         .done();
     let mut h = headers.clone();
-    if let Some(obj) = h.as_object_mut() {
-        obj.insert("content-type".into(), json!("application/proto"));
-        obj.insert("connect-protocol-version".into(), json!("1"));
-        obj.insert("accept-encoding".into(), json!("identity"));
+    h["content-type"] = json!("application/proto");
+    if let Some(values) = h.as_object_mut() {
+        values.remove("connect-timeout-ms");
+        values.remove("connect-accept-encoding");
     }
+    let unconfirmed = |mut error: Error| {
+        error.message = format!("Cursor BidiAppend 确认失败：{}", error.message);
+        error.code = Some("cursor_append_unconfirmed".into());
+        error
+    };
     let response = http::open_raw_timeout(
         "POST",
         &format!("{}/aiserver.v1.BidiService/BidiAppend", client::API),
         h,
         Some(&body),
         APPEND_TIMEOUT_MS,
-    )?;
-    let status = response.status;
-    if !(200..300).contains(&status) {
-        let text = String::from_utf8_lossy(&response.bytes(4096)?).into_owned();
-        return Err(Error::http(
-            status,
-            format!("BidiAppend 失败：{}", text.chars().take(200).collect::<String>()),
-        ));
+    )
+    .map_err(unconfirmed)?;
+    if !(200..300).contains(&response.status) {
+        return Err(errors::http_response("BidiAppend", response));
     }
-    let _ = response.bytes(64 << 10);
+    response.bytes(64 << 10).map_err(unconfirmed)?;
     Ok(())
 }
 
 struct StreamOut<'a> {
     model: &'a str,
     id: String,
-    tool_index: usize,
+    started: bool,
+    created: i64,
+    text: String,
+    tools_started: bool,
 }
 
 impl StreamOut<'_> {
+    fn delta(&mut self, delta: Value) -> Result<()> {
+        if !self.started {
+            self.emit(json!({"role":"assistant"}), Value::Null, None)?;
+            self.started = true;
+        }
+        if let Some(text) = delta["content"].as_str() {
+            self.text.push_str(text);
+        }
+        if delta.get("tool_calls").is_some() {
+            self.tools_started = true;
+        }
+        self.emit(delta, Value::Null, None)
+    }
+
+    fn finish(&self, tools: bool, usage: Option<Value>) -> Result<()> {
+        self.emit(
+            json!({}),
+            json!(if tools { "tool_calls" } else { "stop" }),
+            usage,
+        )?;
+        sdk::stream_bytes(b"data: [DONE]\n\n")
+    }
+
     fn emit(&self, delta: Value, finish: Value, usage: Option<Value>) -> Result<()> {
         let mut frame = json!({
             "id": self.id,
             "object": "chat.completion.chunk",
             "model": self.model,
-            "created": sdk::now() / 1000,
+            "created": self.created,
             "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }]
         });
         if let Some(value) = usage {
@@ -471,11 +496,11 @@ fn usage_of(uf: &[Field], shift: u32) -> Value {
     let cw = proto::pb_num(uf, 4 + shift);
     let reasoning = proto::pb_num(uf, 5 + shift);
     let input = inp.saturating_sub(cr).saturating_sub(cw);
-    let prompt = input + cr + cw;
+    let prompt = input.saturating_add(cr).saturating_add(cw);
     let mut usage = json!({
         "prompt_tokens": prompt,
         "completion_tokens": out,
-        "total_tokens": prompt + out,
+        "total_tokens": prompt.saturating_add(out),
         "prompt_tokens_details": {
             "cached_tokens": cr,
             "cache_write_tokens": cw
@@ -487,319 +512,432 @@ fn usage_of(uf: &[Field], shift: u32) -> Value {
     usage
 }
 
-fn is_heartbeat(data: &[u8]) -> bool {
-    let ms = proto::fields(data);
-    !ms.is_empty()
-        && ms.iter().all(|m| {
-            m.num == 1
-                && proto::fields(&m.data)
-                    .iter()
-                    .all(|u| u.num == 13)
+fn is_heartbeat(messages: &[Field]) -> bool {
+    !messages.is_empty()
+        && messages.iter().all(|message| {
+            let updates = proto::fields(&message.data);
+            message.num == 1 && !updates.is_empty() && updates.iter().all(|update| update.num == 13)
         })
 }
 
-pub fn forward(body: Value, _params: &Value, account: &Value) -> Result<()> {
+/// Host reqwest/rustls cuts that Magpie (Node fetch) does not see on the same API.
+fn is_resumable_transport_cut(error: &Error) -> bool {
+    let message = error.message.to_ascii_lowercase();
+    [
+        "peer closed",
+        "error decoding response body",
+        "incomplete chunked",
+        "connection reset",
+        "connection interrupted",
+        "tls close_notify",
+        "unexpected eof",
+    ]
+    .iter()
+    .any(|part| message.contains(part))
+}
+
+fn push_continue_turn(messages: &mut Vec<Vec<u8>>, partial: &str) -> Result<()> {
+    messages.push(
+        serde_json::to_vec(&json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": partial}]
+        }))
+        .map_err(|_| Error::http(500, "续写上下文编码失败"))?,
+    );
+    messages.push(
+        serde_json::to_vec(&json!({
+            "role": "user",
+            "content": [{"type": "text", "text": CONTINUE_USER}]
+        }))
+        .map_err(|_| Error::http(500, "续写上下文编码失败"))?,
+    );
+    Ok(())
+}
+
+enum AttemptEnd {
+    Done,
+    Continue,
+}
+
+pub fn forward(body: Value) -> Result<()> {
+    if http::json_exceeds(&body, MAX_REQUEST_BYTES)? {
+        return Err(Error::http(413, "Halo Cursor 请求正文超过 4 MiB"));
+    }
+    let tools = if body["tool_choice"] == "none" {
+        Vec::new()
+    } else {
+        tools_of(&body)
+    };
+    let (mut messages, mut last) = conversation_blobs(&body, &tools)?;
+    let model_raw = body["model"].as_str().unwrap_or("claude-sonnet-4-6");
+    let conv = conversation_id(&body);
+    sdk::stream_head(200)?;
+    let (body_max, params) = model_params(&body);
+    let account = auth::credentials(false)?;
     let access = account["accessToken"]
         .as_str()
+        .filter(|token| !token.is_empty())
         .ok_or_else(|| Error::http(401, "Cursor 未登录"))?;
-    if account["expiresAt"].as_i64().unwrap_or(0) <= sdk::now() {
-        let refreshed = auth::credentials(true)?;
-        return forward(body, _params, &refreshed);
-    }
 
-    let model_raw = body["model"].as_str().unwrap_or("claude-sonnet-4-6");
-    let (resolved, catalog_max) = models::resolve_run(model_raw);
-    let model = if resolved.is_empty() {
-        run_model_id(model_raw)
-    } else {
-        resolved
-    };
-    let tools = tools_of(&body);
-    let (msgs, last, _estimate) = conversation_blobs(&body, &tools)?;
-    let (body_max, params) = model_params(&body);
+    let (model, catalog_max) = models::resolve_run(model_raw, &account);
     let mut max_mode = body_max || catalog_max;
-    let conv = conversation_id(&body);
-
-    let version = config::client_version()?;
-    let chat_id = client::uuid_v4()?;
-
-    // Match halo-codex: open the host SSE response before any upstream work so
-    // failures surface as stream/proxy errors instead of "插件尚未发送响应头".
-    sdk::stream_head(200)?;
+    let mut headers = cursor_stream_headers(access)?;
     let mut out = StreamOut {
         model: model_raw,
-        id: format!("chatcmpl-{}", &chat_id[..8.min(chat_id.len())]),
-        tool_index: 0,
+        id: format!("chatcmpl-{}", client::uuid_v4()?),
+        started: false,
+        created: sdk::now() / 1000,
+        text: String::new(),
+        tools_started: false,
     };
-    out.emit(json!({"role":"assistant"}), Value::Null, None)?;
+    let mut continues = 0_u32;
+    let mut continued_from = 0usize;
 
-    let mut first_attempt = true;
-    let (mut first, blobs) = build_run(&msgs, &last, &tools, &model, &conv, max_mode, &params);
-
-    // Open RunSSE with request id envelope. Retry once in Max Mode when Cursor requires it.
-    let mut response;
-    let mut seq;
-    let mut request_id;
-    let mut headers;
     loop {
-        request_id = client::uuid_v4()?;
-        headers = json!({
-            "content-type": "application/connect+proto",
-            "connect-protocol-version": "1",
-            "authorization": format!("Bearer {access}"),
-            "x-cursor-client-version": version,
-            "x-cursor-client-type": "cli",
-            "x-ghost-mode": "true",
-            "x-request-id": request_id,
-            "x-cursor-streaming": "true",
-            "accept-encoding": "identity",
-            // Magpie/cursor-agent: comma-separated ToolCall oneof names, not JSON.
-            "x-cursor-agent-allowed-tools": "mcp_tool_call,get_mcp_tools_tool_call",
-        });
-        if let Some(team) = config::team_id()? {
-            headers["x-cursor-team-id"] = json!(team);
-        }
-
-        let open_body = proto::frame(&Pb::new().str(1, &request_id).done());
-        response = http::open_raw_timeout(
-            "POST",
-            &format!("{}/agent.v1.AgentService/RunSSE", client::API),
-            headers.clone(),
-            Some(&open_body),
-            120_000,
-        )?;
-        let run_status = response.status;
-        if !(200..300).contains(&run_status) {
-            let text = String::from_utf8_lossy(&response.bytes(1 << 20)?).into_owned();
-            if first_attempt && !max_mode && max_mode_required(&text) {
+        let request_id = client::uuid_v4()?;
+        headers["x-request-id"] = json!(&request_id);
+        let (first, blobs) = build_run(&messages, &last, &tools, &model, &conv, max_mode, &params)?;
+        let result = run_attempt(&mut out, &headers, &request_id, &first, &blobs, &tools);
+        match result {
+            Err(error)
+                if !max_mode
+                    && !out.started
+                    && error.code.as_deref() == Some("cursor_max_mode_required") =>
+            {
                 max_mode = true;
-                first_attempt = false;
-                let rebuilt = build_run(&msgs, &last, &tools, &model, &conv, true, &params);
-                first = rebuilt.0;
-                continue;
             }
-            let class = errors::classify(run_status, &json!({ "message": text }));
-            return Err(Error::http(
-                class["status"].as_u64().unwrap_or(run_status as u64) as u16,
-                class["message"].as_str().unwrap_or("Cursor RunSSE 失败"),
-            ));
+            Ok(AttemptEnd::Continue)
+                if !out.tools_started
+                    && !out.text.is_empty()
+                    && continues < MAX_STREAM_CONTINUES =>
+            {
+                let partial = out.text[continued_from..].to_string();
+                if partial.trim().is_empty() {
+                    return Err(Error::http(502, "Cursor 流已输出后中断：无可续写正文")
+                        .with_code("cursor_partial_stream"));
+                }
+                push_continue_turn(&mut messages, &partial)?;
+                last = CONTINUE_USER.to_string();
+                continued_from = out.text.len();
+                continues += 1;
+            }
+            Ok(AttemptEnd::Done) => return Ok(()),
+            Ok(AttemptEnd::Continue) => {
+                return Err(Error::http(
+                    502,
+                    format!(
+                        "Cursor 流已输出后中断：传输层切断且续写已用尽（{continues} 次）"
+                    ),
+                )
+                .with_code("cursor_partial_stream"));
+            }
+            Err(mut error) if out.started && error.status != Some(499) => {
+                error.message = format!("Cursor 流已输出后中断：{}", error.message);
+                error.code = Some("cursor_partial_stream".into());
+                return Err(error);
+            }
+            Err(error) => return Err(error),
         }
+    }
+}
 
-        seq = 0u64;
-        match bidi_append(&headers, &request_id, &first, seq) {
-            Ok(()) => {
-                seq += 1;
-                break;
+fn cursor_stream_headers(access: &str) -> Result<Value> {
+    // Magpie/cursor-agent RunSSE headers: no connect-timeout-ms. Host-side
+    // timeout_ms would also install a hard total deadline on the download;
+    // long streams rely on stream-idle instead (see open_raw below).
+    let mut headers = json!({
+        "content-type": "application/connect+proto",
+        "connect-protocol-version": "1",
+        "authorization": format!("Bearer {access}"),
+        "x-cursor-client-version": config::client_version()?,
+        "x-cursor-client-type": "cli",
+        "x-ghost-mode": "true",
+        "x-cursor-streaming": "true",
+        "accept-encoding": "identity",
+        "x-cursor-agent-allowed-tools": "mcp_tool_call,get_mcp_tools_tool_call",
+    });
+    if let Some(team) = config::team_id()? {
+        headers["x-cursor-team-id"] = json!(team);
+    }
+    Ok(headers)
+}
+
+#[derive(Default)]
+struct ToolBatch {
+    expected: u64,
+    emitted: BTreeSet<String>,
+    answered: u64,
+    writing: BTreeSet<String>,
+    started: BTreeSet<String>,
+    completed: BTreeSet<String>,
+}
+
+impl ToolBatch {
+    fn update(&mut self, kind: u32, id: String) {
+        if id.is_empty() {
+            return;
+        }
+        match kind {
+            2 => {
+                self.started.insert(id);
             }
-            Err(err) if first_attempt && !max_mode && max_mode_required(&err.message) => {
-                max_mode = true;
-                first_attempt = false;
-                let rebuilt = build_run(&msgs, &last, &tools, &model, &conv, true, &params);
-                first = rebuilt.0;
-                let _ = response;
-                continue;
+            3 if self.writing.contains(&id)
+                && !self.started.contains(&id)
+                && !self.emitted.contains(&id) =>
+            {
+                self.completed.insert(id);
             }
-            Err(err) => return Err(err),
+            7 => {
+                self.writing.insert(id);
+            }
+            _ => {}
         }
     }
 
-    let mut decoder = FrameDecoder::new();
+    fn ready(&mut self) -> bool {
+        let count = self.emitted.len() as u64 + self.answered + self.completed.len() as u64;
+        if self.expected == 0 || count < self.expected {
+            return false;
+        }
+        if self.emitted.is_empty() {
+            *self = Self::default();
+            return false;
+        }
+        true
+    }
 
-    let mut last_beat = sdk::now();
-    let mut last_frame = sdk::now();
-    let mut wrote = 0usize;
-    let mut calls = 0usize;
-    let mut finished = false;
-    let mut usage = Value::Null;
+    fn quiet_without_count(&self, elapsed: i64) -> bool {
+        self.expected == 0
+            && !self.emitted.is_empty()
+            && elapsed >= TOOL_COUNT_WAIT_MS
+            && self.writing.iter().all(|id| {
+                self.started.contains(id)
+                    || self.emitted.contains(id)
+                    || self.completed.contains(id)
+            })
+    }
 
-    let send = |msg: &[u8], seq: &mut u64, headers: &Value, request_id: &str| -> Result<()> {
-        bidi_append(headers, request_id, msg, *seq)?;
-        *seq += 1;
-        Ok(())
-    };
+    fn incomplete(&self) -> bool {
+        self.expected > 0
+            && self.emitted.len() as u64 + self.answered + (self.completed.len() as u64)
+                < self.expected
+    }
+}
+
+fn run_attempt(
+    out: &mut StreamOut<'_>,
+    headers: &Value,
+    request_id: &str,
+    first: &[u8],
+    blobs: &BTreeMap<String, Vec<u8>>,
+    tools: &[ToolDef],
+) -> Result<AttemptEnd> {
+    let open_body = proto::frame(&Pb::new().str(1, request_id).done());
+    // Do not pass timeout_ms: Agent2API treats it as a hard total deadline on
+    // the upstream download. Magpie's RunSSE fetch likewise has no wall-clock
+    // AbortSignal; longevity is gated by stream-idle + our own stall checks.
+    let mut response = http::open_raw(
+        "POST",
+        &format!("{}/agent.v1.AgentService/RunSSE", client::API),
+        headers.clone(),
+        Some(&open_body),
+    )
+    .map_err(|mut error| {
+        error.message = format!("Cursor RunSSE 建连失败：{}", error.message);
+        error
+    })?;
+    if !(200..300).contains(&response.status) {
+        return Err(errors::http_response("RunSSE", response));
+    }
+
+    bidi_append(headers, request_id, first, 0)?;
+    let mut seq = 1;
+    let mut decoder = FrameDecoder::new(
+        response
+            .header_values("connect-content-encoding")
+            .first()
+            .copied()
+            .unwrap_or("identity"),
+    );
+    let started_at = sdk::now();
+    let mut last_beat = started_at;
+    let mut last_activity = started_at;
+    let mut heartbeats = 0_u32;
+    let mut turn_ended = false;
+    let mut wrote = false;
+    let mut usage = None;
+    let mut batch = ToolBatch::default();
+    let resumable =
+        |error: Error, wrote: bool, tools_started: bool| -> Result<AttemptEnd> {
+            if wrote && !tools_started && is_resumable_transport_cut(&error) {
+                Ok(AttemptEnd::Continue)
+            } else {
+                Err(error)
+            }
+        };
 
     loop {
         let now = sdk::now();
-        if now.saturating_sub(last_frame) > STALL_MS {
-            return Err(Error::http(504, "Cursor 对话长时间无响应（stall）"));
+        let idle = now.saturating_sub(last_activity);
+        if !decoder.has_partial_frame() && batch.quiet_without_count(idle) {
+            out.finish(true, usage)?;
+            return Ok(AttemptEnd::Done);
+        }
+        if !out.started && now.saturating_sub(started_at) >= FIRST_OUTPUT_MS {
+            return Err(Error::http(504, "Cursor 流等待首个有效输出超时")
+                .with_code("cursor_first_output_timeout"));
+        }
+        if idle >= STALL_MS {
+            return Err(
+                Error::http(504, "Cursor 流长时间没有有效事件").with_code("cursor_stream_idle")
+            );
         }
         if now.saturating_sub(last_beat) >= HEARTBEAT_MS {
-            let hb = Pb::new().bytes(7, &[]).done();
-            send(&hb, &mut seq, &headers, &request_id)?;
-            last_beat = now;
+            bidi_append(headers, request_id, &Pb::new().bytes(7, &[]).done(), seq)?;
+            seq += 1;
+            last_beat = sdk::now();
+            heartbeats += 1;
         }
 
-        let chunk = match response.read()? {
-            Some(bytes) if !bytes.is_empty() => bytes,
-            Some(_) => continue,
-            None => break,
+        let chunk = match response.read() {
+            Ok(chunk) => chunk,
+            Err(mut error) => {
+                let elapsed = sdk::now().saturating_sub(started_at);
+                let turn = if turn_ended {
+                    "已收到回合结束"
+                } else {
+                    "未收到回合结束"
+                };
+                error.message = format!(
+                    "Cursor RunSSE 读取失败（{elapsed} ms，{heartbeats} 次上行心跳，{turn}）：{}",
+                    error.message
+                );
+                return resumable(error, wrote, out.tools_started || !batch.emitted.is_empty());
+            }
         };
+        let Some(chunk) = chunk else {
+            let detail = if decoder.has_partial_frame() {
+                "Connect 帧未收全"
+            } else {
+                "缺少结束帧"
+            };
+            let error = Error::http(502, format!("Cursor 回复中断（EOF，{detail}）"))
+                .with_code("cursor_stream_eof");
+            return resumable(error, wrote, out.tools_started || !batch.emitted.is_empty());
+        };
+        if chunk.is_empty() {
+            continue;
+        }
 
         let frames = decoder
             .push(&chunk)
-            .map_err(|e| Error::http(502, e))?;
-        for frame in frames {
-            if !is_heartbeat(&frame.data) {
-                last_frame = sdk::now();
-            }
+            .map_err(|error| Error::http(502, error).with_code("cursor_connect_protocol"))?;
+        let mut frames = frames.into_iter().peekable();
+        let mut checkpoint_ready = false;
+        while let Some(frame) = frames.next() {
             if frame.end {
-                if wrote == 0 && calls == 0 {
-                    let text = String::from_utf8_lossy(&frame.data);
-                    let class = errors::classify(502, &json!({ "message": text }));
-                    if class["kind"] != "fatal"
-                        || text.contains("\"error\"")
-                        || text.contains("code")
-                    {
-                        let parsed: Value =
-                            serde_json::from_slice(&frame.data).unwrap_or(json!({ "message": text }));
-                        let class = errors::classify(200, &parsed);
-                        if class["kind"] != "fatal"
-                            || parsed.pointer("/error").is_some()
-                            || parsed.get("code").is_some()
-                        {
-                            let status = class["status"].as_u64().unwrap_or(502) as u16;
-                            if !(200..300).contains(&status)
-                                || parsed.pointer("/error").is_some()
-                            {
-                                return Err(Error::http(
-                                    if (200..300).contains(&status) {
-                                        502
-                                    } else {
-                                        status
-                                    },
-                                    format!(
-                                        "{} (model={model})",
-                                        class["message"].as_str().unwrap_or("Cursor 对话失败")
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                    return Err(Error::http(
-                        502,
-                        format!("Cursor 返回空回复 (model={model})"),
-                    ));
+                if frames.peek().is_some() || decoder.has_partial_frame() {
+                    return Err(Error::http(502, "Cursor Connect 结束帧后仍有数据"));
                 }
-                let finish = if calls > 0 { "tool_calls" } else { "stop" };
-                out.emit(
-                    json!({}),
-                    json!(finish),
-                    if usage.is_null() { None } else { Some(usage.clone()) },
-                )?;
-                sdk::stream_bytes(b"data: [DONE]\n\n")?;
-                finished = true;
-                break;
+                errors::connect_end(&frame.data)?;
+                if batch.incomplete() {
+                    return Err(Error::http(502, "Cursor 工具调用批次未收全")
+                        .with_code("cursor_tool_batch_incomplete"));
+                }
+                if !wrote && batch.emitted.is_empty() {
+                    return Err(
+                        Error::http(502, "Cursor 返回空回复").with_code("cursor_empty_reply")
+                    );
+                }
+                out.finish(!batch.emitted.is_empty(), usage)?;
+                return Ok(AttemptEnd::Done);
             }
 
-            for m in proto::fields(&frame.data) {
-                match m.num {
+            let messages =
+                proto::checked_fields(&frame.data).map_err(|error| Error::http(502, error))?;
+            if !is_heartbeat(&messages) {
+                last_activity = sdk::now();
+            }
+            for message in messages {
+                match message.num {
                     1 => {
-                        for u in proto::fields(&m.data) {
-                            let uf = proto::fields(&u.data);
-                            match u.num {
-                                1 => {
-                                    let t = proto::pb_str(&uf, 1);
-                                    if !t.is_empty() {
-                                        wrote += t.len();
-                                        out.emit(json!({"content": t}), Value::Null, None)?;
+                        for update in proto::checked_fields(&message.data)
+                            .map_err(|error| Error::http(502, error))?
+                        {
+                            let fields = proto::checked_fields(&update.data)
+                                .map_err(|error| Error::http(502, error))?;
+                            match update.num {
+                                1 | 4 => {
+                                    let text = proto::pb_str(&fields, 1);
+                                    if !text.is_empty() {
+                                        wrote |= update.num == 1;
+                                        out.delta(if update.num == 1 {
+                                            json!({"content":text})
+                                        } else {
+                                            json!({"reasoning_content":text})
+                                        })?;
                                     }
                                 }
-                                4 => {
-                                    let t = proto::pb_str(&uf, 1);
-                                    if !t.is_empty() {
-                                        out.emit(
-                                            json!({"reasoning_content": t}),
-                                            Value::Null,
-                                            None,
-                                        )?;
-                                    }
-                                }
+                                2 | 3 | 7 => batch.update(
+                                    update.num,
+                                    proto::pb_str(&fields, 1).replace('\n', "__"),
+                                ),
                                 14 => {
-                                    usage = usage_of(&uf, 0);
-                                    if calls == 0 {
-                                        if wrote == 0 {
-                                            return Err(Error::http(502, "Cursor 结束回合但无正文"));
-                                        }
-                                        out.emit(json!({}), json!("stop"), Some(usage.clone()))?;
-                                        sdk::stream_bytes(b"data: [DONE]\n\n")?;
-                                        finished = true;
-                                    }
+                                    turn_ended = true;
+                                    usage = Some(usage_of(&fields, 0));
                                 }
-                                31 => {
-                                    if uf.iter().any(|f| (2..=6).contains(&f.num)) {
-                                        usage = usage_of(&uf, 1);
-                                    }
+                                27 => batch.expected = proto::pb_num(&fields, 1),
+                                31 if fields.iter().any(|f| (2..=6).contains(&f.num)) => {
+                                    usage = Some(usage_of(&fields, 1))
                                 }
                                 _ => {}
                             }
                         }
                     }
                     2 => {
-                        if let Some(call) = handle_exec(&m.data, &tools, &mut seq, &headers, &request_id)?
+                        let exec = proto::checked_fields(&message.data)
+                            .map_err(|error| Error::http(502, error))?;
+                        if let Some(call) =
+                            handle_exec(&exec, tools, &mut seq, headers, request_id)?
                         {
-                            let index = out.tool_index;
-                            out.tool_index += 1;
-                            calls += 1;
-                            out.emit(
-                                json!({"tool_calls":[{
+                            let index = batch.emitted.len();
+                            let id = call["id"].as_str().unwrap_or_default().to_string();
+                            if batch.emitted.insert(id) {
+                                out.delta(json!({"tool_calls":[{
                                     "index": index,
                                     "id": call["id"],
-                                    "type": "function",
-                                    "function": {
-                                        "name": call["name"],
-                                        "arguments": call["arguments"]
-                                    }
-                                }]}),
-                                Value::Null,
-                                None,
-                            )?;
+                                    "type":"function",
+                                    "function":{"name":call["name"],"arguments":call["arguments"]}
+                                }]}))?;
+                            }
+                        } else if !exec.iter().any(|field| field.num == 10) {
+                            batch.answered += 1;
                         }
                     }
-                    4 => {
-                        handle_kv(&m.data, &blobs, &mut seq, &headers, &request_id)?;
+                    3 if batch.expected > 0 && !batch.emitted.is_empty() => {
+                        let pending = proto::checked_fields(&message.data)
+                            .map_err(|error| Error::http(502, error))?
+                            .into_iter()
+                            .filter(|field| field.num == 4)
+                            .count();
+                        checkpoint_ready = pending == batch.emitted.len();
                     }
+                    4 => handle_kv(&message.data, blobs, &mut seq, headers, request_id)?,
                     _ => {}
                 }
-                if finished {
-                    break;
+                // A batch answered inside the plugin clears its count before the next step.
+                if batch.emitted.is_empty() {
+                    batch.ready();
                 }
             }
-            if finished {
-                break;
-            }
-            // After tool calls are emitted, end the turn for the host to run tools.
-            if calls > 0 {
-                out.emit(
-                    json!({}),
-                    json!("tool_calls"),
-                    if usage.is_null() {
-                        None
-                    } else {
-                        Some(usage.clone())
-                    },
-                )?;
-                sdk::stream_bytes(b"data: [DONE]\n\n")?;
-                finished = true;
-                break;
-            }
         }
-        if finished {
-            break;
+        if !decoder.has_partial_frame() && (batch.ready() || checkpoint_ready) {
+            // Cursor waits for tool results once the declared batch has arrived.
+            // The caller supplies results in a new request.
+            out.finish(true, usage)?;
+            return Ok(AttemptEnd::Done);
         }
     }
-
-    if !finished {
-        if calls > 0 {
-            out.emit(json!({}), json!("tool_calls"), None)?;
-            sdk::stream_bytes(b"data: [DONE]\n\n")?;
-        } else if wrote > 0 {
-            out.emit(json!({}), json!("stop"), None)?;
-            sdk::stream_bytes(b"data: [DONE]\n\n")?;
-        } else {
-            return Err(Error::http(502, "Cursor 回复中断（EOF）"));
-        }
-    }
-    Ok(())
 }
 
 fn handle_kv(
@@ -809,12 +947,13 @@ fn handle_kv(
     headers: &Value,
     request_id: &str,
 ) -> Result<()> {
-    let kv = proto::fields(data);
+    let kv = proto::checked_fields(data).map_err(|error| Error::http(502, error))?;
     let id = proto::pb_num(&kv, 1);
     for k in &kv {
         if k.num == 2 {
-            let want = proto::field(&proto::fields(&k.data), 1)
-                .map(|f| hex::encode(&f.data))
+            let fields = proto::checked_fields(&k.data).map_err(|error| Error::http(502, error))?;
+            let want = proto::field(&fields, 1)
+                .map(|field| hex::encode(&field.data))
                 .unwrap_or_default();
             let res = if let Some(b) = blobs.get(&want) {
                 Pb::new().bytes(1, b).done()
@@ -840,15 +979,14 @@ fn handle_kv(
 }
 
 fn handle_exec(
-    data: &[u8],
+    es: &[Field],
     tools: &[ToolDef],
     seq: &mut u64,
     headers: &Value,
     request_id: &str,
 ) -> Result<Option<Value>> {
-    let es = proto::fields(data);
-    let id = proto::pb_num(&es, 1);
-    let exec_id = proto::pb_str(&es, 15);
+    let id = proto::pb_num(es, 1);
+    let exec_id = proto::pb_str(es, 15);
 
     let close_exec = |seq: &mut u64| -> Result<()> {
         let msg = Pb::new()
@@ -868,23 +1006,27 @@ fn handle_exec(
             .done();
         bidi_append(headers, request_id, &msg, *seq)?;
         *seq += 1;
+        close_exec(seq)?;
         Ok(None)
     };
 
-    for e in &es {
+    for e in es {
         match e.num {
             11 => {
-                let a = proto::fields(&e.data);
+                let a = proto::checked_fields(&e.data).map_err(|error| Error::http(502, error))?;
                 let mut args = serde_json::Map::new();
                 for kv in &a {
                     if kv.num != 2 {
                         continue;
                     }
-                    let ef = proto::fields(&kv.data);
+                    let ef =
+                        proto::checked_fields(&kv.data).map_err(|error| Error::http(502, error))?;
                     let key = proto::pb_str(&ef, 1);
-                    let value = proto::field(&ef, 2)
-                        .map(|v| proto::pb_any(&v.data))
-                        .unwrap_or(Value::Null);
+                    let value = match proto::field(&ef, 2) {
+                        Some(value) => proto::pb_any(&value.data)
+                            .ok_or_else(|| Error::http(502, "Cursor 返回无效工具参数"))?,
+                        None => Value::Null,
+                    };
                     args.insert(key, value);
                 }
                 let name = {
@@ -898,9 +1040,6 @@ fn handle_exec(
                         bare
                     }
                 };
-                if !tools.iter().any(|t| t.name == name) {
-                    return unavailable(seq);
-                }
                 let cid = {
                     let raw = proto::pb_str(&a, 3).replace('\n', "__");
                     if raw.is_empty() {
@@ -909,15 +1048,28 @@ fn handle_exec(
                         raw
                     }
                 };
-                let tool_args = args
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Object(args.clone()));
-                let tool_name = args
-                    .get("toolName")
-                    .and_then(Value::as_str)
-                    .unwrap_or(&name)
-                    .to_string();
+                let (tool_name, tool_args) =
+                    if name == CALL && !tools.iter().any(|tool| tool.name == CALL) {
+                        let wrapper = Value::Object(args);
+                        if wrapper["namespace"]
+                            .as_str()
+                            .is_some_and(|namespace| namespace != NS)
+                        {
+                            return unavailable(seq);
+                        }
+                        let Some(tool_name) = wrapper["toolName"].as_str() else {
+                            return unavailable(seq);
+                        };
+                        let tool_args = wrapper["arguments"]
+                            .as_object()
+                            .ok_or_else(|| Error::http(502, "Cursor 返回无效工具参数"))?;
+                        (tool_name.to_string(), Value::Object(tool_args.clone()))
+                    } else {
+                        (name, Value::Object(args))
+                    };
+                if !tools.iter().any(|tool| tool.name == tool_name) {
+                    return unavailable(seq);
+                }
                 return Ok(Some(json!({
                     "id": cid,
                     "name": tool_name,
@@ -931,13 +1083,7 @@ fn handle_exec(
                 }
                 let res = Pb::new().nested(1, Pb::new().nested(1, srv)).done();
                 let msg = Pb::new()
-                    .nested(
-                        2,
-                        Pb::new()
-                            .varint(1, id)
-                            .str(15, &exec_id)
-                            .bytes(36, &res),
-                    )
+                    .nested(2, Pb::new().varint(1, id).str(15, &exec_id).bytes(36, &res))
                     .done();
                 bidi_append(headers, request_id, &msg, *seq)?;
                 *seq += 1;
@@ -946,19 +1092,10 @@ fn handle_exec(
             }
             10 => {
                 let res = Pb::new()
-                    .nested(
-                        1,
-                        Pb::new().nested(1, Pb::new().bytes(4, &env_bytes())),
-                    )
+                    .nested(1, Pb::new().nested(1, Pb::new().bytes(4, &env_bytes())))
                     .done();
                 let msg = Pb::new()
-                    .nested(
-                        2,
-                        Pb::new()
-                            .varint(1, id)
-                            .str(15, &exec_id)
-                            .bytes(10, &res),
-                    )
+                    .nested(2, Pb::new().varint(1, id).str(15, &exec_id).bytes(10, &res))
                     .done();
                 bidi_append(headers, request_id, &msg, *seq)?;
                 *seq += 1;

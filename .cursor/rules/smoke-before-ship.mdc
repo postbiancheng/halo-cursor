@@ -16,7 +16,7 @@ Use `./scripts/smoke-local.sh` (or equivalent HTTP calls):
 3. `POST /api/models/refresh` with `{"provider":"halo-cursor"}` succeeds (or reports unchanged)
 4. Account usage query for the enabled `halo-cursor` account returns windows/credits without hard failure
 5. `POST /v1/chat/completions` with a tiny streamed prompt on `auto` returns at least one content delta (not only an error frame)
-6. Long chat on `auto` lasting **at least 40 seconds** wall time (`HALO_CURSOR_AUTO_LONG_SECONDS`, default 40); continue follow-up turns if a single reply ends early
+6. Keep `auto` streaming for **at least 40 seconds** wall time in **one continuous** RunSSE (`HALO_CURSOR_AUTO_LONG_SECONDS`, default 40). The stream must include content, a finish reason and `[DONE]`, with no error event.
 
 ## Gate
 

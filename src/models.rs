@@ -8,7 +8,8 @@ use agent2api_wasm_sdk::{
 };
 
 const KEY: &str = "model-catalog";
-const TTL: i64 = 600_000;
+const REFRESH_INTERVAL: i64 = 600_000;
+const RETAIN_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 const FALLBACK: &[(&str, &str, i64)] = &[
     ("claude-sonnet-4-6", "Claude Sonnet 4.6", 200_000),
@@ -19,73 +20,43 @@ const FALLBACK: &[(&str, &str, i64)] = &[
 ];
 
 pub fn fallback() -> Value {
-    Value::Array(
-        FALLBACK
-            .iter()
-            .map(|(id, name, limit)| model(id, name, *limit, None, false))
-            .collect(),
-    )
+    let automatic = std::iter::once(model("auto", "Auto", 200_000, Some("default"), false));
+    let built_in = FALLBACK
+        .iter()
+        .map(|(id, name, limit)| model(id, name, *limit, None, false));
+    Value::Array(automatic.chain(built_in).collect())
 }
 
-fn run_from_models(models: &[Value], model_raw: &str, bare: &str, mapped: &str) -> Option<(String, bool)> {
-    for row in models {
-        let id = row["id"].as_str().unwrap_or("");
-        if id == model_raw || id == bare || (bare == "auto" && id == "auto") {
-            let run = row["runId"]
-                .as_str()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or(mapped);
-            let max_mode = row["maxMode"] == true;
-            return Some((run.to_string(), max_mode));
-        }
-    }
-    None
-}
-
-fn catalog_models() -> Option<Vec<Value>> {
-    if let Ok(snapshot) = load() {
-        if let Some(models) = snapshot
-            .value
-            .pointer("/catalog/models")
-            .and_then(Value::as_array)
-            .cloned()
-        {
-            if !models.is_empty() {
-                return Some(models);
-            }
-        }
-    }
-    None
-}
-
-/// Best-effort refresh so chat can resolve `legacySlug` run ids.
-pub fn ensure_remote_catalog() {
-    let has_run_ids = catalog_models().is_some_and(|models| {
-        models.iter().any(|row| {
-            row["runId"]
-                .as_str()
-                .map(str::trim)
-                .is_some_and(|s| !s.is_empty())
-        })
-    });
-    if has_run_ids {
-        return;
-    }
-    let _ = refresh(&json!({ "force": true, "account": "1" }));
+fn run_from_models(
+    models: &[Value],
+    model_raw: &str,
+    bare: &str,
+    mapped: &str,
+) -> Option<(String, bool)> {
+    let row = models
+        .iter()
+        .find(|row| row["id"] == model_raw)
+        .or_else(|| models.iter().find(|row| row["id"] == bare))?;
+    let run = row["runId"]
+        .as_str()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(mapped);
+    Some((run.to_string(), row["maxMode"] == true))
 }
 
 /// Resolve a picker model id to the Agent Run id (legacySlug) + Max Mode flag.
-pub fn resolve_run(model_raw: &str) -> (String, bool) {
+pub fn resolve_run(model_raw: &str, account: &Value) -> (String, bool) {
     let bare = model_raw.split('@').next().unwrap_or(model_raw);
     let mapped = if bare == "auto" { "default" } else { bare };
 
-    ensure_remote_catalog();
-
     // Prefer the account-scoped catalog we store on refresh — it keeps `runId`.
     // Host `catalog.cached` may strip unknown fields.
-    if let Some(models) = catalog_models() {
-        if let Some(hit) = run_from_models(&models, model_raw, bare, mapped) {
+    if let Some(catalog) = cached_for(account) {
+        if let Some(hit) = catalog["models"]
+            .as_array()
+            .and_then(|models| run_from_models(models, model_raw, bare, mapped))
+        {
             return hit;
         }
     }
@@ -129,7 +100,10 @@ fn variant_slug(v: &Value) -> Option<&str> {
 }
 
 /// Magpie `served`: keep variants whose legacySlug is in GetUsableModels (when known).
-fn served_variants<'a>(row: &'a Value, usable: Option<&std::collections::BTreeSet<String>>) -> Vec<&'a Value> {
+fn served_variants<'a>(
+    row: &'a Value,
+    usable: Option<&std::collections::BTreeSet<String>>,
+) -> Vec<&'a Value> {
     let Some(variants) = row.get("variants").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -225,7 +199,10 @@ fn usable_stable_run(
     current: Option<&str>,
     usable: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
-    let name = row["name"].as_str().map(str::trim).filter(|s| !s.is_empty())?;
+    let name = row["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
     let keys = {
         let mut ks = std::collections::BTreeSet::new();
         ks.insert(family_key(name));
@@ -516,11 +493,23 @@ mod tests {
     }
 
     #[test]
+    fn run_mapping_prefers_exact_variant() {
+        let rows = [
+            json!({"id":"model","runId":"normal"}),
+            json!({"id":"model@1m","runId":"long","maxMode":true}),
+        ];
+        assert_eq!(
+            run_from_models(&rows, "model@1m", "model", "model"),
+            Some(("long".into(), true))
+        );
+    }
+
+    #[test]
     fn resolve_run_maps_auto_without_catalog() {
-        let (id, max) = resolve_run("auto");
+        let (id, max) = resolve_run("auto", &Value::Null);
         assert_eq!(id, "default");
         assert!(!max);
-        let (id, _) = resolve_run("composer-2.5@200k");
+        let (id, _) = resolve_run("composer-2.5@200k", &Value::Null);
         assert_eq!(id, "composer-2.5");
     }
 }
@@ -563,9 +552,18 @@ pub fn refresh(params: &Value) -> Result<Value> {
             }));
         }
     };
+    let started_at = sdk::now();
+    let catalog_lock = client::sha256_b64url(identity(&credentials).as_bytes());
+    let _lock = sdk::AccountLock::acquire_named_conversation(&format!(
+        "halo-cursor/models/{catalog_lock}"
+    ))?;
     let previous = cached_for(&credentials).unwrap_or_else(|| catalog(fallback(), false, 0));
     let age = sdk::now().saturating_sub(previous["meta"]["refreshed_at"].as_i64().unwrap_or(0));
-    if params["force"] != true && previous["meta"]["remote"] == true && (0..TTL).contains(&age) {
+    let refreshed_at = previous["meta"]["refreshed_at"].as_i64().unwrap_or(0);
+    if previous["meta"]["remote"] == true
+        && ((params["force"] != true && (0..REFRESH_INTERVAL).contains(&age))
+            || (refreshed_at >= started_at && refreshed_at > 0))
+    {
         return Ok(sdk::catalog::unchanged(
             previous["models"].as_array().map(Vec::len).unwrap_or(0),
         ));
@@ -582,32 +580,8 @@ pub fn refresh(params: &Value) -> Result<Value> {
         30_000,
     );
 
-    let usable = client::unary_optional(
-        "agent.v1.AgentService/GetUsableModels",
-        access,
-        json!({}),
-    )
-    .and_then(|body| {
-        let models = body.get("models")?.as_array()?;
-        let mut ids = std::collections::BTreeSet::new();
-        for row in models {
-            for key in ["modelId", "displayModelId"] {
-                if let Some(id) = row.get(key).and_then(Value::as_str).map(str::trim) {
-                    if !id.is_empty() {
-                        ids.insert(id.to_string());
-                    }
-                }
-            }
-        }
-        if ids.is_empty() {
-            None
-        } else {
-            Some(ids)
-        }
-    });
-
-    let models = match report {
-        Ok(body) => parse_models(&body, usable.as_ref()),
+    let body = match report {
+        Ok(body) => body,
         Err(error) => {
             return Ok(json!({
                 "refreshed": false,
@@ -616,6 +590,34 @@ pub fn refresh(params: &Value) -> Result<Value> {
             }));
         }
     };
+    let usable = client::unary_optional("agent.v1.AgentService/GetUsableModels", access, json!({}))
+        .and_then(|body| {
+            let models = body.get("models")?.as_array()?;
+            let mut ids = std::collections::BTreeSet::new();
+            for row in models {
+                for key in ["modelId", "displayModelId"] {
+                    if let Some(id) = row.get(key).and_then(Value::as_str).map(str::trim) {
+                        if !id.is_empty() {
+                            ids.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+            if ids.is_empty() {
+                None
+            } else {
+                Some(ids)
+            }
+        });
+
+    let models = parse_models(&body, usable.as_ref());
+    if models.is_empty() {
+        return Ok(json!({
+            "refreshed": false,
+            "message": "Cursor 返回空模型目录",
+            "count": previous["models"].as_array().map(Vec::len).unwrap_or(0)
+        }));
+    }
 
     let now = sdk::now();
     let next = catalog(Value::Array(models.clone()), true, now);
@@ -623,10 +625,16 @@ pub fn refresh(params: &Value) -> Result<Value> {
     // Retry once on revision conflict so chat can still see runId.
     for _ in 0..2 {
         let snapshot = load()?;
-        if state::compare_exchange(Scope::Account, KEY, 1, snapshot.revision, payload.clone(), TTL)?
-        {
-            break;
+        if state::compare_exchange(
+            Scope::Account,
+            KEY,
+            1,
+            snapshot.revision,
+            payload.clone(),
+            RETAIN_MS,
+        )? {
+            return Ok(sdk::catalog::refreshed(models));
         }
     }
-    Ok(sdk::catalog::refreshed(models))
+    Err(Error::http(409, "保存 Cursor 模型目录时发生并发更新"))
 }
