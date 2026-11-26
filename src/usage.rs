@@ -646,3 +646,186 @@ fn sand_window(sand: Option<&Value>, now: i64) -> Option<SandWindow> {
         resets_at,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_included_pools_and_aside_total() {
+        let report = parse(
+            &json!({
+                "billingCycleEnd": "1800000000",
+                "planUsage": {
+                    "autoPercentUsed": 25.0,
+                    "apiPercentUsed": 10.0,
+                    "totalPercentUsed": 20.0,
+                    "remainingBonus": false,
+                    "bonusSpend": 0
+                }
+            }),
+            None,
+            &[],
+            None,
+            "Pro+",
+        )
+        .unwrap();
+        assert_eq!(report["available"], json!(75.0));
+        assert_eq!(report["windows"][0]["name"], "Cursor Models");
+        assert_eq!(report["windows"][0]["remainingPercent"], json!(75.0));
+        assert_eq!(report["windows"][1]["name"], "Other Models");
+        let total = report["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["name"] == "Total")
+            .unwrap();
+        assert_eq!(total["aside"], true);
+        assert_eq!(report["subscription"]["planName"], "Pro+");
+    }
+
+    #[test]
+    fn surfaces_on_demand_and_ignores_disabled_hard_limit() {
+        let open = parse(
+            &json!({
+                "billingCycleEnd": 1800000000000_i64,
+                "planUsage": {
+                    "autoPercentUsed": 100.0,
+                    "apiPercentUsed": 100.0,
+                    "totalPercentUsed": 100.0
+                },
+                "spendLimitUsage": { "individualUsed": 250, "individualLimit": 1000 }
+            }),
+            Some(&json!({ "hardLimit": 50, "noUsageBasedAllowed": false })),
+            &[],
+            None,
+            "Pro",
+        )
+        .unwrap();
+        // Magpie: when GetHardLimit is present (non-team), hardLimit (dollars) wins.
+        let od = open["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["name"] == "On-demand")
+            .unwrap();
+        assert_eq!(od["display"], "$2.50 / $50.00");
+        assert!(open["available"].is_null()); // pools spent but on-demand open
+
+        let by_spend = parse(
+            &json!({
+                "planUsage": {
+                    "autoPercentUsed": 50.0,
+                    "apiPercentUsed": 0.0,
+                    "totalPercentUsed": 50.0
+                },
+                "spendLimitUsage": { "individualUsed": 250, "individualLimit": 1000 }
+            }),
+            None,
+            &[],
+            None,
+            "",
+        )
+        .unwrap();
+        let od2 = by_spend["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["name"] == "On-demand")
+            .unwrap();
+        assert_eq!(od2["display"], "$2.50 / $10.00");
+
+        let disabled = parse(
+            &json!({
+                "planUsage": {
+                    "autoPercentUsed": 50.0,
+                    "apiPercentUsed": 0.0,
+                    "totalPercentUsed": 50.0
+                }
+            }),
+            Some(&json!({ "noUsageBasedAllowed": true })),
+            &[],
+            None,
+            "",
+        )
+        .unwrap();
+        assert!(disabled["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| w["name"] != "On-demand"));
+    }
+
+    #[test]
+    fn surfaces_grok_bot_aside_and_free_usage() {
+        let report = parse(
+            &json!({
+                "billingCycleEnd": "1800000000",
+                "planUsage": {
+                    "autoPercentUsed": 10.0,
+                    "apiPercentUsed": 0.0,
+                    "totalPercentUsed": 10.0,
+                    "remainingBonus": true,
+                    "bonusSpend": 1234
+                }
+            }),
+            None,
+            &[],
+            Some(&json!({
+                "hasNonZeroIncludedLimit": true,
+                "usagePercent": 40.0,
+                "nextResetTimestampUtc": "2026-12-01T00:00:00.000Z"
+            })),
+            "Pro+",
+        )
+        .unwrap();
+        let bot = report["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["name"] == "Grok Bot")
+            .unwrap();
+        assert_eq!(bot["aside"], true);
+        assert_eq!(bot["remainingPercent"], json!(60.0));
+        let free = report["credits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "Free usage")
+            .unwrap();
+        assert!(free["display"].as_str().unwrap().contains("$12.34"));
+    }
+
+    #[test]
+    fn surfaces_active_grants_as_usd_credits() {
+        let report = parse(
+            &json!({
+                "planUsage": {
+                    "autoPercentUsed": 0.0,
+                    "apiPercentUsed": 0.0,
+                    "totalPercentUsed": 0.0
+                }
+            }),
+            None,
+            &[json!({
+                "campaignName": "Promo",
+                "totalCents": "1000",
+                "remainingCents": "250",
+                "expiresAtMs": "9999999999999",
+                "allowedClientTypes": ["cli"]
+            })],
+            None,
+            "Pro",
+        )
+        .unwrap();
+        let credit = report["credits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "Promo")
+            .unwrap();
+        assert_eq!(credit["remain"], json!(2.5));
+        assert_eq!(credit["limit"], json!(10.0));
+        assert_eq!(credit["unit"], "USD");
+    }
+}

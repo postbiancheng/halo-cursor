@@ -66,14 +66,32 @@ fn metadata() -> Value {
 }
 
 fn public(secret: &Value) -> Value {
-    json!({
-        "name": "Halo Cursor",
+    let email = secret["email"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let name = email.unwrap_or("Halo Cursor");
+    let mut view = json!({
+        "name": name,
         "accountId": secret["accountId"],
-        "email": secret["email"],
         "plan": secret["plan"],
         "expiresAt": secret["expiresAt"],
         "tokenExpiresAt": secret["expiresAt"]
-    })
+    });
+    if let Some(email) = email {
+        view["email"] = json!(email);
+        view["loginName"] = json!(email);
+    }
+    view
+}
+
+fn admin(params: &Value) -> Result<Value> {
+    match params["action"].as_str().unwrap_or("") {
+        "auth.methods" => Ok(login_methods()),
+        // Outbound UA is per request (x-cursor-client-*), not account-wide.
+        "network.user-agent" => Ok(json!({ "accountWide": false })),
+        _ => Err(Error::unsupported()),
+    }
 }
 
 fn normalized(secret: Value) -> Value {
@@ -109,7 +127,7 @@ fn handle(method: &str, mut params: Value) -> Result<Value> {
         "account.identity" => Ok(params["secret"]["identity"].clone()),
         "models.list" => models::list(&params),
         "models.refresh" => models::refresh(&params),
-        "admin.action" if params["action"] == "auth.methods" => Ok(login_methods()),
+        "admin.action" => admin(&params),
         "usage.query" => usage::query(),
         "conversation" => {
             let account = auth::credentials(false)?;

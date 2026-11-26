@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent2api-halo-cursor"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agent2api-wasm-sdk",
  "base64",

@@ -1,6 +1,9 @@
 //! Cursor Agent RunSSE + BidiAppend chat forward (HTTP/1.1, Magpie-aligned).
 
-use super::{auth, client, config, errors, proto::{self, Field, FrameDecoder, Pb}};
+use super::{
+    auth, client, config, errors, models,
+    proto::{self, Field, FrameDecoder, Pb},
+};
 use agent2api_wasm_sdk::{self as sdk, http, json, Error, Result, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -393,7 +396,19 @@ fn model_params(body: &Value) -> (bool, Vec<(String, String)>) {
 }
 
 fn run_model_id(model: &str) -> String {
-    model.split('@').next().unwrap_or(model).to_string()
+    let bare = model.split('@').next().unwrap_or(model);
+    if bare == "auto" {
+        "default".into()
+    } else {
+        bare.to_string()
+    }
+}
+
+fn max_mode_required(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("max mode required")
+        || lower.contains("max mode") && lower.contains("required")
+        || lower.contains("请开启 max mode")
 }
 
 fn bidi_append(headers: &Value, request_id: &str, msg: &[u8], seq: u64) -> Result<()> {
@@ -493,61 +508,102 @@ pub fn forward(body: Value, _params: &Value, account: &Value) -> Result<()> {
     }
 
     let model_raw = body["model"].as_str().unwrap_or("claude-sonnet-4-6");
-    let model = run_model_id(model_raw);
+    let (resolved, catalog_max) = models::resolve_run(model_raw);
+    let model = if resolved.is_empty() {
+        run_model_id(model_raw)
+    } else {
+        resolved
+    };
     let tools = tools_of(&body);
     let (msgs, last, _estimate) = conversation_blobs(&body, &tools)?;
-    let (max_mode, params) = model_params(&body);
+    let (body_max, params) = model_params(&body);
+    let mut max_mode = body_max || catalog_max;
     let conv = conversation_id(&body);
-    let (first, blobs) = build_run(&msgs, &last, &tools, &model, &conv, max_mode, &params);
 
-    let request_id = client::uuid_v4()?;
     let version = config::client_version()?;
-    let mut headers = json!({
-        "content-type": "application/connect+proto",
-        "connect-protocol-version": "1",
-        "authorization": format!("Bearer {access}"),
-        "x-cursor-client-version": version,
-        "x-cursor-client-type": "cli",
-        "x-ghost-mode": "true",
-        "x-request-id": request_id,
-        "x-cursor-streaming": "true",
-        "accept-encoding": "identity",
-        "x-cursor-agent-allowed-tools": "[]",
-    });
-    if let Some(team) = config::team_id()? {
-        headers["x-cursor-team-id"] = json!(team);
-    }
+    let chat_id = client::uuid_v4()?;
 
-    // Open RunSSE with request id envelope.
-    let open_body = proto::frame(&Pb::new().str(1, &request_id).done());
-    let mut response = http::open_raw_timeout(
-        "POST",
-        &format!("{}/agent.v1.AgentService/RunSSE", client::API),
-        headers.clone(),
-        Some(&open_body),
-        120_000,
-    )?;
-    let run_status = response.status;
-    if !(200..300).contains(&run_status) {
-        let text = String::from_utf8_lossy(&response.bytes(1 << 20)?).into_owned();
-        let class = errors::classify(run_status, &json!({ "message": text }));
-        return Err(Error::http(
-            class["status"].as_u64().unwrap_or(run_status as u64) as u16,
-            class["message"].as_str().unwrap_or("Cursor RunSSE 失败"),
-        ));
-    }
-
-    let mut seq = 0u64;
-    bidi_append(&headers, &request_id, &first, seq)?;
-    seq += 1;
-
-    let mut decoder = FrameDecoder::new();
+    // Match halo-codex: open the host SSE response before any upstream work so
+    // failures surface as stream/proxy errors instead of "插件尚未发送响应头".
+    sdk::stream_head(200)?;
     let mut out = StreamOut {
         model: model_raw,
-        id: format!("chatcmpl-{}", &request_id[..8.min(request_id.len())]),
+        id: format!("chatcmpl-{}", &chat_id[..8.min(chat_id.len())]),
         tool_index: 0,
     };
     out.emit(json!({"role":"assistant"}), Value::Null, None)?;
+
+    let mut first_attempt = true;
+    let (mut first, blobs) = build_run(&msgs, &last, &tools, &model, &conv, max_mode, &params);
+
+    // Open RunSSE with request id envelope. Retry once in Max Mode when Cursor requires it.
+    let mut response;
+    let mut seq;
+    let mut request_id;
+    let mut headers;
+    loop {
+        request_id = client::uuid_v4()?;
+        headers = json!({
+            "content-type": "application/connect+proto",
+            "connect-protocol-version": "1",
+            "authorization": format!("Bearer {access}"),
+            "x-cursor-client-version": version,
+            "x-cursor-client-type": "cli",
+            "x-ghost-mode": "true",
+            "x-request-id": request_id,
+            "x-cursor-streaming": "true",
+            "accept-encoding": "identity",
+            // Magpie/cursor-agent: comma-separated ToolCall oneof names, not JSON.
+            "x-cursor-agent-allowed-tools": "mcp_tool_call,get_mcp_tools_tool_call",
+        });
+        if let Some(team) = config::team_id()? {
+            headers["x-cursor-team-id"] = json!(team);
+        }
+
+        let open_body = proto::frame(&Pb::new().str(1, &request_id).done());
+        response = http::open_raw_timeout(
+            "POST",
+            &format!("{}/agent.v1.AgentService/RunSSE", client::API),
+            headers.clone(),
+            Some(&open_body),
+            120_000,
+        )?;
+        let run_status = response.status;
+        if !(200..300).contains(&run_status) {
+            let text = String::from_utf8_lossy(&response.bytes(1 << 20)?).into_owned();
+            if first_attempt && !max_mode && max_mode_required(&text) {
+                max_mode = true;
+                first_attempt = false;
+                let rebuilt = build_run(&msgs, &last, &tools, &model, &conv, true, &params);
+                first = rebuilt.0;
+                continue;
+            }
+            let class = errors::classify(run_status, &json!({ "message": text }));
+            return Err(Error::http(
+                class["status"].as_u64().unwrap_or(run_status as u64) as u16,
+                class["message"].as_str().unwrap_or("Cursor RunSSE 失败"),
+            ));
+        }
+
+        seq = 0u64;
+        match bidi_append(&headers, &request_id, &first, seq) {
+            Ok(()) => {
+                seq += 1;
+                break;
+            }
+            Err(err) if first_attempt && !max_mode && max_mode_required(&err.message) => {
+                max_mode = true;
+                first_attempt = false;
+                let rebuilt = build_run(&msgs, &last, &tools, &model, &conv, true, &params);
+                first = rebuilt.0;
+                let _ = response;
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    let mut decoder = FrameDecoder::new();
 
     let mut last_beat = sdk::now();
     let mut last_frame = sdk::now();
@@ -611,12 +667,18 @@ pub fn forward(body: Value, _params: &Value, account: &Value) -> Result<()> {
                                     } else {
                                         status
                                     },
-                                    class["message"].as_str().unwrap_or("Cursor 对话失败"),
+                                    format!(
+                                        "{} (model={model})",
+                                        class["message"].as_str().unwrap_or("Cursor 对话失败")
+                                    ),
                                 ));
                             }
                         }
                     }
-                    return Err(Error::http(502, "Cursor 返回空回复"));
+                    return Err(Error::http(
+                        502,
+                        format!("Cursor 返回空回复 (model={model})"),
+                    ));
                 }
                 let finish = if calls > 0 { "tool_calls" } else { "stop" };
                 out.emit(

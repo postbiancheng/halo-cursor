@@ -1,0 +1,25 @@
+---
+description: Require live Agent2API smoke before commit/push/release
+alwaysApply: true
+---
+
+# Smoke before ship
+
+Before **commit / push / tag / GitHub Release / 宣称安装完成**, run a **live smoke** against the local Agent2API (`127.0.0.1:3065`) with a real `halo-cursor` account. Unit tests + pack + plugin `ready` alone are not enough.
+
+## Minimum smoke
+
+Use `./scripts/smoke-local.sh` (or equivalent HTTP calls):
+
+1. Plugin pack `agent2api-wasm-halo-cursor` is installed at the expected version and `startup.phase=ready`
+2. `GET /v1/models` lists models `owned_by=halo-cursor` including `auto`
+3. `POST /api/models/refresh` with `{"provider":"halo-cursor"}` succeeds (or reports unchanged)
+4. Account usage query for the enabled `halo-cursor` account returns windows/credits without hard failure
+5. `POST /v1/chat/completions` with a tiny streamed prompt on `auto` returns at least one content delta (not only an error frame)
+6. Long chat on `auto` lasting **at least 40 seconds** wall time (`HALO_CURSOR_AUTO_LONG_SECONDS`, default 40); continue follow-up turns if a single reply ends early
+
+## Gate
+
+- Smoke **fails** → do not commit/push/tag; fix or report the failure first.
+- Smoke **passes** → then commit / push / release as requested.
+- If Agent2API or a usable Cursor account is unavailable, say so explicitly and **stop** before ship steps; do not skip silently.

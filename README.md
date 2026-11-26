@@ -32,6 +32,16 @@ Agent2API WASM 插件仓库：https://github.com/postbiancheng/halo-cursor
 
 产物：`dist/agent2api-wasm-halo-cursor-<version>.zip`（含 `assets/logo.svg`）
 
+## 冒烟
+
+本机 Agent2API（默认 `127.0.0.1:3065`）已安装当前版本、且有可用 Cursor 账号时：
+
+```bash
+./scripts/smoke-local.sh
+```
+
+短对话 + `auto` 长测（默认 ≥40s，可用 `HALO_CURSOR_AUTO_LONG_SECONDS` 调整）。发版前应过烟测。
+
 ## 安装
 
 在 Agent2API 中安装上述 zip，或对本机已运行的实例：
@@ -41,7 +51,7 @@ Agent2API WASM 插件仓库：https://github.com/postbiancheng/halo-cursor
 python3 - <<'PY'
 import base64, json, urllib.request, os
 key = os.environ["AGENT2API_API_KEY"]
-zip_path = "dist/agent2api-wasm-halo-cursor-0.1.0.zip"
+zip_path = "dist/agent2api-wasm-halo-cursor-0.1.2.zip"
 body = json.dumps({"packB64": base64.b64encode(open(zip_path, "rb").read()).decode()}).encode()
 req = urllib.request.Request(
     "http://127.0.0.1:3065/api/plugins/install",
@@ -55,5 +65,6 @@ PY
 
 ## 版本摘要
 
+- **0.1.2**：对话按 `legacySlug` / GetUsableModels 选稳定 variant；`cli-` 客户端版本；早发响应头与 Max Mode 重试；错误 details 解析；`auto` 冒烟脚本
 - **0.1.1**：用量补齐 On-demand、活动赠金 grants、Grok Bot（`get-sand-usage-status`，aside）
 - **0.1.0**：首版——Deep Control / API Key 登录、模型目录、用量、RunSSE 对话转发与错误分类

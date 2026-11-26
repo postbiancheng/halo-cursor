@@ -1,6 +1,8 @@
 use agent2api_wasm_sdk::{self as sdk, json, Result, Value};
 
-pub const DEFAULT_CLIENT_VERSION: &str = "2026.09.23-86fc751";
+/// Magpie/cursor-agent calendar build (no `cli-` prefix). Prefer a version that
+/// exists under `~/.local/share/cursor-agent/versions`.
+pub const DEFAULT_CLIENT_VERSION: &str = "2026.09.26-dd393fe";
 pub const REASONING_AUTO: &str = "auto";
 
 pub fn schema() -> Value {
@@ -17,8 +19,8 @@ pub fn schema() -> Value {
                 "default": DEFAULT_CLIENT_VERSION,
                 "trim": true,
                 "empty_is_default": true,
-                "max_length": 48,
-                "description": "上报给 Cursor 的 x-cursor-client-version，建议与本机 cursor-agent 一致。"
+                "max_length": 64,
+                "description": "上报给 Cursor 的 x-cursor-client-version（自动补 cli- 前缀），建议与本机 cursor-agent 一致。"
             },
             {
                 "key": "teamId",
@@ -48,14 +50,22 @@ pub fn schema() -> Value {
     })
 }
 
+/// Header value Cursor expects: `cli-<yyyy.mm.dd-hash>` (Magpie/`cursor-agent`).
 pub fn client_version() -> Result<String> {
     let value = sdk::settings::get("clientVersion")?;
     let trimmed = value.as_str().map(str::trim).unwrap_or("");
-    if trimmed.is_empty() {
-        Ok(DEFAULT_CLIENT_VERSION.into())
+    let raw = if trimmed.is_empty() {
+        DEFAULT_CLIENT_VERSION
     } else {
-        Ok(trimmed.chars().take(48).collect())
-    }
+        trimmed
+    };
+    let bare = raw
+        .strip_prefix("cli-")
+        .unwrap_or(raw)
+        .chars()
+        .take(48)
+        .collect::<String>();
+    Ok(format!("cli-{bare}"))
 }
 
 pub fn team_id() -> Result<Option<String>> {

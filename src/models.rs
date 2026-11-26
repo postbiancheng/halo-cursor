@@ -22,13 +22,86 @@ pub fn fallback() -> Value {
     Value::Array(
         FALLBACK
             .iter()
-            .map(|(id, name, limit)| model(id, name, *limit))
+            .map(|(id, name, limit)| model(id, name, *limit, None, false))
             .collect(),
     )
 }
 
-fn model(id: &str, name: &str, limit: i64) -> Value {
-    json!({
+fn run_from_models(models: &[Value], model_raw: &str, bare: &str, mapped: &str) -> Option<(String, bool)> {
+    for row in models {
+        let id = row["id"].as_str().unwrap_or("");
+        if id == model_raw || id == bare || (bare == "auto" && id == "auto") {
+            let run = row["runId"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(mapped);
+            let max_mode = row["maxMode"] == true;
+            return Some((run.to_string(), max_mode));
+        }
+    }
+    None
+}
+
+fn catalog_models() -> Option<Vec<Value>> {
+    if let Ok(snapshot) = load() {
+        if let Some(models) = snapshot
+            .value
+            .pointer("/catalog/models")
+            .and_then(Value::as_array)
+            .cloned()
+        {
+            if !models.is_empty() {
+                return Some(models);
+            }
+        }
+    }
+    None
+}
+
+/// Best-effort refresh so chat can resolve `legacySlug` run ids.
+pub fn ensure_remote_catalog() {
+    let has_run_ids = catalog_models().is_some_and(|models| {
+        models.iter().any(|row| {
+            row["runId"]
+                .as_str()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty())
+        })
+    });
+    if has_run_ids {
+        return;
+    }
+    let _ = refresh(&json!({ "force": true, "account": "1" }));
+}
+
+/// Resolve a picker model id to the Agent Run id (legacySlug) + Max Mode flag.
+pub fn resolve_run(model_raw: &str) -> (String, bool) {
+    let bare = model_raw.split('@').next().unwrap_or(model_raw);
+    let mapped = if bare == "auto" { "default" } else { bare };
+
+    ensure_remote_catalog();
+
+    // Prefer the account-scoped catalog we store on refresh — it keeps `runId`.
+    // Host `catalog.cached` may strip unknown fields.
+    if let Some(models) = catalog_models() {
+        if let Some(hit) = run_from_models(&models, model_raw, bare, mapped) {
+            return hit;
+        }
+    }
+
+    if let Ok(cached) = sdk::catalog::cached() {
+        if let Some(models) = cached["models"].as_array() {
+            if let Some(hit) = run_from_models(models, model_raw, bare, mapped) {
+                return hit;
+            }
+        }
+    }
+    (mapped.to_string(), false)
+}
+
+fn model(id: &str, name: &str, limit: i64, run_id: Option<&str>, max_mode: bool) -> Value {
+    let mut row = json!({
         "id": id,
         "name": name,
         "kind": "chat",
@@ -38,7 +111,190 @@ fn model(id: &str, name: &str, limit: i64) -> Value {
             "maxOutputTokens": 128000,
             "supportsTools": true
         }
-    })
+    });
+    if let Some(run) = run_id.filter(|s| !s.is_empty()) {
+        row["runId"] = json!(run);
+    }
+    if max_mode {
+        row["maxMode"] = json!(true);
+    }
+    row
+}
+
+fn variant_slug(v: &Value) -> Option<&str> {
+    v.get("legacySlug")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Magpie `served`: keep variants whose legacySlug is in GetUsableModels (when known).
+fn served_variants<'a>(row: &'a Value, usable: Option<&std::collections::BTreeSet<String>>) -> Vec<&'a Value> {
+    let Some(variants) = row.get("variants").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let Some(ids) = usable else {
+        return variants.iter().collect();
+    };
+    let got: Vec<&Value> = variants
+        .iter()
+        .filter(|v| variant_slug(v).is_none_or(|slug| ids.contains(slug)))
+        .collect();
+    if got.iter().any(|v| variant_slug(v).is_some()) {
+        got
+    } else {
+        variants.iter().collect()
+    }
+}
+
+fn is_stable_slug(slug: &str) -> bool {
+    // Magpie request pick defaults to fast=false (fast costs more); thinking is opt-in.
+    let s = slug.to_ascii_lowercase();
+    !s.contains("fast") && !s.contains("thinking")
+}
+
+/// Pick run variant: prefer non-fast / non-thinking (Magpie `fromUsable(..., false)`),
+/// then Magpie defaults, then first served.
+fn default_variant<'a>(
+    row: &'a Value,
+    usable: Option<&std::collections::BTreeSet<String>>,
+) -> Option<&'a Value> {
+    let variants = served_variants(row, usable);
+    let stable = |v: &&Value| variant_slug(v).is_some_and(is_stable_slug);
+    variants
+        .iter()
+        .copied()
+        .find(|v| v["isDefaultNonMaxConfig"] == true && stable(&v))
+        .or_else(|| {
+            variants
+                .iter()
+                .copied()
+                .find(|v| v["isDefaultMaxConfig"] == true && stable(&v))
+        })
+        .or_else(|| variants.iter().copied().find(stable))
+        .or_else(|| {
+            variants
+                .iter()
+                .copied()
+                .find(|v| v["isDefaultNonMaxConfig"] == true)
+        })
+        .or_else(|| {
+            variants
+                .iter()
+                .copied()
+                .find(|v| v["isDefaultMaxConfig"] == true)
+        })
+        .or_else(|| variants.first().copied())
+}
+
+/// Rough Magpie family key: drop cursor- / effort / fast / thinking suffixes.
+fn family_key(id: &str) -> String {
+    let mut s = id.trim().to_ascii_lowercase();
+    if let Some(rest) = s.strip_prefix("cursor-") {
+        s = rest.to_string();
+    }
+    for _ in 0..4 {
+        let before = s.clone();
+        for suffix in [
+            "-fast",
+            "-thinking",
+            "-xhigh",
+            "-extra-high",
+            "-high",
+            "-medium",
+            "-low",
+            "-minimal",
+            "-none",
+            "-max",
+        ] {
+            if let Some(rest) = s.strip_suffix(suffix) {
+                s = rest.to_string();
+                break;
+            }
+        }
+        if s == before {
+            break;
+        }
+    }
+    s
+}
+
+/// Magpie `fromUsable(fam, "", false)`: stable usable id for this picker model.
+fn usable_stable_run(
+    row: &Value,
+    current: Option<&str>,
+    usable: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    let name = row["name"].as_str().map(str::trim).filter(|s| !s.is_empty())?;
+    let keys = {
+        let mut ks = std::collections::BTreeSet::new();
+        ks.insert(family_key(name));
+        if let Some(cur) = current {
+            ks.insert(family_key(cur));
+        }
+        for slug in row
+            .get("variants")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(variant_slug)
+        {
+            ks.insert(family_key(slug));
+        }
+        ks
+    };
+    let mut hits: Vec<&String> = usable
+        .iter()
+        .filter(|id| is_stable_slug(id) && keys.contains(&family_key(id)))
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    // Magpie fromUsable(..., false): exact name → no effort → medium → rest.
+    fn effort_rank(id: &str) -> u8 {
+        let lower = id.to_ascii_lowercase();
+        for (suf, rank) in [
+            ("-xhigh", 6u8),
+            ("-extra-high", 6),
+            ("-high", 5),
+            ("-max", 7),
+            ("-medium", 2),
+            ("-low", 4),
+            ("-minimal", 3),
+            ("-none", 3),
+        ] {
+            if lower.ends_with(suf) {
+                return rank;
+            }
+        }
+        1 // bare family id (Cursor's default effort)
+    }
+    hits.sort_by_key(|id| (id.as_str() != name, effort_rank(id), id.len(), *id));
+    Some(hits[0].clone())
+}
+
+fn variant_run(
+    row: &Value,
+    usable: Option<&std::collections::BTreeSet<String>>,
+) -> (Option<String>, bool) {
+    let (run, max_mode) = match default_variant(row, usable) {
+        Some(v) => {
+            let run = variant_slug(v).map(str::to_string);
+            let max_mode = row["supportsNonMaxMode"] == false || v["isMaxMode"] == true;
+            (run, max_mode)
+        }
+        None => (None, false),
+    };
+    if let Some(ids) = usable {
+        let current = run.as_deref();
+        let needs_swap = current.is_none_or(|s| !is_stable_slug(s) || !ids.contains(s));
+        if needs_swap {
+            if let Some(preferred) = usable_stable_run(row, current, ids) {
+                return (Some(preferred), max_mode);
+            }
+        }
+    }
+    (run, max_mode)
 }
 
 fn catalog(models: Value, remote: bool, refreshed_at: i64) -> Value {
@@ -67,7 +323,7 @@ fn cached_for(secret: &Value) -> Option<Value> {
     Some(catalog.clone())
 }
 
-fn parse_models(body: &Value) -> Vec<Value> {
+fn parse_models(body: &Value, usable: Option<&std::collections::BTreeSet<String>>) -> Vec<Value> {
     let mut out = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
 
@@ -96,10 +352,13 @@ fn parse_models(body: &Value) -> Vec<Value> {
         }
         if name == "default" {
             if seen.insert("auto".into()) {
+                let (run, max_mode) = variant_run(&row, usable);
                 out.push(model(
                     "auto",
                     row["clientDisplayName"].as_str().unwrap_or("Auto"),
                     row["contextTokenLimit"].as_i64().unwrap_or(200_000).max(1),
+                    run.as_deref().or(Some("default")),
+                    max_mode,
                 ));
             }
             continue;
@@ -113,6 +372,7 @@ fn parse_models(body: &Value) -> Vec<Value> {
             .or_else(|| row["contextTokenLimitForMaxMode"].as_i64())
             .unwrap_or(200_000)
             .max(1);
+        let (run, max_mode) = variant_run(&row, usable);
 
         let contexts: Vec<String> = row
             .pointer("/variants")
@@ -129,14 +389,46 @@ fn parse_models(body: &Value) -> Vec<Value> {
 
         if contexts.is_empty() {
             if seen.insert(name.to_string()) {
-                out.push(model(name, title, limit));
+                out.push(model(name, title, limit, run.as_deref(), max_mode));
             }
         } else {
             for ctx in contexts {
                 let id = format!("{name}@{ctx}");
                 if seen.insert(id.clone()) {
                     let tokens = parse_context_tokens(&ctx).unwrap_or(limit);
-                    out.push(model(&id, &format!("{title} @ {ctx}"), tokens));
+                    // Prefer a stable (non-fast / non-thinking) variant at this context.
+                    let ctx_match = |v: &Value| {
+                        v.pointer("/parameterValues/context")
+                            .or_else(|| v.get("context"))
+                            .and_then(Value::as_str)
+                            == Some(ctx.as_str())
+                    };
+                    let ctx_variants: Vec<&Value> = row
+                        .get("variants")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|v| ctx_match(v))
+                        .collect();
+                    let ctx_v = ctx_variants
+                        .iter()
+                        .copied()
+                        .find(|v| variant_slug(v).is_some_and(is_stable_slug))
+                        .or_else(|| ctx_variants.first().copied());
+                    let ctx_run = ctx_v
+                        .and_then(variant_slug)
+                        .map(str::to_string)
+                        .or(run.clone());
+                    let ctx_max = ctx_v
+                        .map(|v| row["supportsNonMaxMode"] == false || v["isMaxMode"] == true)
+                        .unwrap_or(max_mode);
+                    out.push(model(
+                        &id,
+                        &format!("{title} @ {ctx}"),
+                        tokens,
+                        ctx_run.as_deref(),
+                        ctx_max,
+                    ));
                 }
             }
         }
@@ -145,10 +437,91 @@ fn parse_models(body: &Value) -> Vec<Value> {
     if out.is_empty() {
         FALLBACK
             .iter()
-            .map(|(id, name, limit)| model(id, name, *limit))
+            .map(|(id, name, limit)| model(id, name, *limit, None, false))
             .collect()
     } else {
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_default_model_to_auto_with_run_id() {
+        let models = parse_models(
+            &json!({
+                "models": [{
+                    "name": "default",
+                    "clientDisplayName": "Auto",
+                    "contextTokenLimit": 200000,
+                    "supportsAgent": true,
+                    "variants": [{
+                        "legacySlug": "default",
+                        "isDefaultNonMaxConfig": true
+                    }]
+                }, {
+                    "name": "grok-4.6",
+                    "clientDisplayName": "Grok 4.6",
+                    "contextTokenLimit": 256000,
+                    "supportsAgent": true,
+                    "variants": [{
+                        "legacySlug": "cursor-grok-4.6-high-fast",
+                        "isDefaultNonMaxConfig": true
+                    }, {
+                        "legacySlug": "grok-4.6-high"
+                    }]
+                }, {
+                    "name": "claude-haiku-4-5",
+                    "clientDisplayName": "Claude Haiku 4.5",
+                    "contextTokenLimit": 200000,
+                    "supportsAgent": true,
+                    "variants": [{
+                        "legacySlug": "claude-4.5-haiku-thinking",
+                        "isDefaultNonMaxConfig": true
+                    }, {
+                        "legacySlug": "claude-4.5-haiku"
+                    }]
+                }]
+            }),
+            None,
+        );
+        assert_eq!(models[0]["id"], "auto");
+        assert_eq!(models[0]["runId"], "default");
+        assert_eq!(models[1]["id"], "grok-4.6");
+        // Prefer non-fast even when Magpie default is the fast SKU.
+        assert_eq!(models[1]["runId"], "grok-4.6-high");
+        assert_eq!(models[2]["id"], "claude-haiku-4-5");
+        assert_eq!(models[2]["runId"], "claude-4.5-haiku");
+
+        let mut usable = std::collections::BTreeSet::new();
+        usable.insert("composer-2.5".into());
+        usable.insert("composer-2.5-fast".into());
+        let models = parse_models(
+            &json!({
+                "models": [{
+                    "name": "composer-2.5",
+                    "clientDisplayName": "Composer 2.5",
+                    "supportsAgent": true,
+                    "variants": [{
+                        "legacySlug": "composer-2.5-fast",
+                        "isDefaultNonMaxConfig": true
+                    }]
+                }]
+            }),
+            Some(&usable),
+        );
+        assert_eq!(models[0]["runId"], "composer-2.5");
+    }
+
+    #[test]
+    fn resolve_run_maps_auto_without_catalog() {
+        let (id, max) = resolve_run("auto");
+        assert_eq!(id, "default");
+        assert!(!max);
+        let (id, _) = resolve_run("composer-2.5@200k");
+        assert_eq!(id, "composer-2.5");
     }
 }
 
@@ -209,8 +582,32 @@ pub fn refresh(params: &Value) -> Result<Value> {
         30_000,
     );
 
+    let usable = client::unary_optional(
+        "agent.v1.AgentService/GetUsableModels",
+        access,
+        json!({}),
+    )
+    .and_then(|body| {
+        let models = body.get("models")?.as_array()?;
+        let mut ids = std::collections::BTreeSet::new();
+        for row in models {
+            for key in ["modelId", "displayModelId"] {
+                if let Some(id) = row.get(key).and_then(Value::as_str).map(str::trim) {
+                    if !id.is_empty() {
+                        ids.insert(id.to_string());
+                    }
+                }
+            }
+        }
+        if ids.is_empty() {
+            None
+        } else {
+            Some(ids)
+        }
+    });
+
     let models = match report {
-        Ok(body) => parse_models(&body),
+        Ok(body) => parse_models(&body, usable.as_ref()),
         Err(error) => {
             return Ok(json!({
                 "refreshed": false,
@@ -222,14 +619,14 @@ pub fn refresh(params: &Value) -> Result<Value> {
 
     let now = sdk::now();
     let next = catalog(Value::Array(models.clone()), true, now);
-    let snapshot = load()?;
-    let _ = state::compare_exchange(
-        Scope::Account,
-        KEY,
-        1,
-        snapshot.revision,
-        json!({ "source": identity(&credentials), "catalog": next }),
-        TTL,
-    )?;
+    let payload = json!({ "source": identity(&credentials), "catalog": next });
+    // Retry once on revision conflict so chat can still see runId.
+    for _ in 0..2 {
+        let snapshot = load()?;
+        if state::compare_exchange(Scope::Account, KEY, 1, snapshot.revision, payload.clone(), TTL)?
+        {
+            break;
+        }
+    }
     Ok(sdk::catalog::refreshed(models))
 }
