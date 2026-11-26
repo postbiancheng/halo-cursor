@@ -96,6 +96,77 @@ pub fn get_plan(token: &str) -> Option<Value> {
     unary("aiserver.v1.DashboardService/GetPlanInfo", token, json!({})).ok()
 }
 
+/// Soft-fail unary: None on transport/HTTP/parse errors (usage extras).
+pub fn unary_optional(path: &str, token: &str, body: Value) -> Option<Value> {
+    unary(path, token, body).ok()
+}
+
+fn encode_uri_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// WorkOS dashboard user id from a CLI JWT (`sub` last `|` segment).
+pub fn session_user_id(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    let sub = claims.get("sub")?.as_str()?;
+    let user = sub.split('|').filter(|s| !s.is_empty()).next_back()?;
+    if user.is_empty()
+        || !user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    Some(user.to_string())
+}
+
+/// Grok Bot / Sand allowance (website dashboard cookie session). Soft-fail.
+pub fn sand_usage_status(token: &str) -> Option<Value> {
+    let user = session_user_id(token)?;
+    let cookie = format!(
+        "WorkosCursorSessionToken={}",
+        encode_uri_component(&format!("{user}::{token}"))
+    );
+    let url = format!("{WEBSITE}/api/dashboard/get-sand-usage-status");
+    let response = http::open_timeout(
+        "POST",
+        &url,
+        json!({
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": WEBSITE,
+            "Cookie": cookie,
+        }),
+        Some(&json!({})),
+        5_000,
+    )
+    .ok()?;
+    if !(200..300).contains(&response.status) {
+        return None;
+    }
+    response.json().ok()
+}
+
 #[allow(dead_code)]
 pub fn agent_url(token: &str) -> String {
     match unary_timeout(

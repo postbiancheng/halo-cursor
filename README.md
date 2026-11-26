@@ -13,7 +13,7 @@ Agent2API WASM 插件仓库：https://github.com/postbiancheng/halo-cursor
 | 登录 | 浏览器 Deep Control（PKCE + `/auth/poll`），或导入 Integrations API Key |
 | 模型 | 登录后 `AiService/AvailableModels`；缓存约 10 分钟；失败回退内置默认 |
 | 对话 | 固定 HTTP/1.1：`AgentService/RunSSE` + `BidiService/BidiAppend` |
-| 用量 | `DashboardService/GetCurrentPeriodUsage`（含套餐窗口 / 赠金） |
+| 用量 | 套餐窗口 + On-demand（`GetHardLimit`）+ 活动赠金 grants + Grok Bot Sand |
 | 设置 | clientVersion、teamId、默认推理强度 |
 | 错误 | classify / retry.decision：鉴权失效、额度/限流、内容策略 |
 
@@ -55,4 +55,5 @@ PY
 
 ## 版本摘要
 
+- **0.1.1**：用量补齐 On-demand、活动赠金 grants、Grok Bot（`get-sand-usage-status`，aside）
 - **0.1.0**：首版——Deep Control / API Key 登录、模型目录、用量、RunSSE 对话转发与错误分类
