@@ -60,6 +60,7 @@ function hostRun(scenario) {
   const scenarioAttempts = scenario.attempts.map((config) => ({...config, chunks: [...config.chunks]}))
   const events = []
   const calls = []
+  const sleeps = []
   const appended = []
   const memory = () => Buffer.from(instance.exports.memory.buffer)
   const base64 = (data) => Buffer.from(data).toString("base64")
@@ -76,7 +77,7 @@ function hostRun(scenario) {
         result = 1_700_000_000_000 + tick
         break
       case "clock.sleep":
-        assert.equal(params.milliseconds, 50)
+        sleeps.push(params.milliseconds)
         tick += params.milliseconds
         break
       case "state.get":
@@ -168,7 +169,7 @@ function hostRun(scenario) {
   const start = Number(packed & 0xffffffffn)
   const output = JSON.parse(memory().subarray(start, start + Number(packed >> 32n)).toString())
   return {
-    output, calls, appended, elapsed: tick, attempts: attempt + 1,
+    output, calls, sleeps, appended, elapsed: tick, attempts: attempt + 1,
     done: events.some((line) => line === "data: [DONE]\n\n"),
     frames: events.filter((line) => !line.includes("[DONE]")).map((line) => JSON.parse(line.slice(6))),
   }
@@ -179,7 +180,16 @@ test("empty reads back off instead of spinning until the fuel window is exhauste
   assert.equal(run.done, true)
   assert.equal(run.frames.at(-1).choices[0].finish_reason, "stop")
   assert.equal(run.calls.filter((method) => method === "clock.sleep").length, 2)
-  assert.equal(run.elapsed, 100)
+  assert.equal(run.elapsed, 150)
+})
+
+test("sustained empty reads cap at one second and real data resets the delay", () => {
+  const run = hostRun({attempts: [{chunks: [
+    ...Array.from({length: 7}, () => Buffer.alloc(0)),
+    content("ok"), Buffer.alloc(0), Buffer.alloc(0), end(),
+  ]}]})
+  assert.equal(run.done, true)
+  assert.deepEqual(run.sleeps, [50, 100, 200, 400, 800, 1000, 1000, 50, 100])
 })
 
 test("normal completion preserves trailing usage and supports arbitrary framing", () => {

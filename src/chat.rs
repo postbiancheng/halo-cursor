@@ -12,6 +12,8 @@ const NS: &str = "tools";
 const CALL: &str = "CallDynamicTool";
 const NO_RESULT: &str = "Tool use was interrupted and did not produce a result.";
 const HEARTBEAT_MS: i64 = 5_000;
+const EMPTY_READ_INITIAL_MS: u64 = 50;
+const EMPTY_READ_MAX_MS: u64 = 1_000;
 const FIRST_OUTPUT_MS: i64 = 60_000;
 const STALL_MS: i64 = 90_000;
 const TOOL_COUNT_WAIT_MS: i64 = 30_000;
@@ -760,6 +762,7 @@ fn run_attempt(
     let mut last_beat = started_at;
     let mut last_activity = started_at;
     let mut heartbeats = 0_u32;
+    let mut empty_read_delay = EMPTY_READ_INITIAL_MS;
     let mut turn_ended = false;
     let mut wrote = false;
     let mut reasoned = false;
@@ -831,11 +834,14 @@ fn run_attempt(
             );
         };
         if chunk.is_empty() {
-            // An empty read is not upstream progress and does not replenish the
-            // host fuel window. Back off instead of spinning until it is exhausted.
-            sdk::sleep(50)?;
+            // Empty reads do not replenish the host fuel window. Keep first-byte
+            // latency low, then cap polling at 1 Hz so long thinking pauses do not
+            // burn the whole window before Cursor produces its next event.
+            sdk::sleep(empty_read_delay)?;
+            empty_read_delay = empty_read_delay.saturating_mul(2).min(EMPTY_READ_MAX_MS);
             continue;
         }
+        empty_read_delay = EMPTY_READ_INITIAL_MS;
 
         let frames = decoder
             .push(&chunk)
