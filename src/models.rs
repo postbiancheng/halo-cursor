@@ -72,14 +72,23 @@ pub fn resolve_run(model_raw: &str, account: &Value) -> (String, bool) {
 }
 
 fn model(id: &str, name: &str, limit: i64, run_id: Option<&str>, max_mode: bool) -> Value {
+    // Agent2API routing / capability::effective read TOP-LEVEL keys
+    // (supportsToolCall, maxInputTokens, …). Nested `capabilities.supportsTools`
+    // alone is ignored, which left auto/composer as “工具调用能力未声明”.
     let mut row = json!({
         "id": id,
         "name": name,
         "kind": "chat",
         "provider": PROVIDER,
+        "supportsToolCall": true,
+        "supportsImages": true,
+        "maxInputTokens": limit,
+        "maxOutputTokens": 128000,
         "capabilities": {
             "maxInputTokens": limit,
             "maxOutputTokens": 128000,
+            "supportsToolCall": true,
+            "supportsImages": true,
             "supportsTools": true
         }
     });
@@ -466,7 +475,11 @@ mod tests {
         );
         assert_eq!(models[0]["id"], "auto");
         assert_eq!(models[0]["runId"], "default");
+        assert_eq!(models[0]["supportsToolCall"], true);
+        assert_eq!(models[0]["supportsImages"], true);
+        assert_eq!(models[0]["maxInputTokens"], 200000);
         assert_eq!(models[1]["id"], "grok-4.6");
+        assert_eq!(models[1]["supportsToolCall"], true);
         // Prefer non-fast even when Magpie default is the fast SKU.
         assert_eq!(models[1]["runId"], "grok-4.6-high");
         assert_eq!(models[2]["id"], "claude-haiku-4-5");

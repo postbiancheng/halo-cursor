@@ -57,7 +57,7 @@ Agent2API WASM 插件仓库：https://github.com/postbiancheng/halo-cursor
 python3 - <<'PY'
 import base64, json, urllib.request, os
 key = os.environ["AGENT2API_API_KEY"]
-zip_path = "dist/agent2api-wasm-halo-cursor-0.1.3.zip"
+zip_path = "dist/agent2api-wasm-halo-cursor-0.1.4.zip"
 body = json.dumps({"packB64": base64.b64encode(open(zip_path, "rb").read()).decode()}).encode()
 req = urllib.request.Request(
     "http://127.0.0.1:3065/api/plugins/install",
@@ -71,6 +71,7 @@ PY
 
 ## 版本摘要
 
+- **0.1.4**：目录顶层声明 `supportsToolCall` / `supportsImages` 与 token 上限，避免路由组因「工具调用能力未声明」剔空成员。
 - **0.1.3**：修复流结束判定和 Max Mode 重试，支持跨帧工具批次与 gzip，移出对话中的网络目录刷新；RunSSE 传输层约 30 秒切断时自动续写；并加强重试、冒烟和构建校验。
 
 - **0.1.2**：对话按 `legacySlug` / GetUsableModels 选稳定 variant；`cli-` 客户端版本；早发响应头与 Max Mode 重试；错误 details 解析；`auto` 冒烟脚本
