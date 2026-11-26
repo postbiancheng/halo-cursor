@@ -20,7 +20,7 @@ const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 /// Agent2API's reqwest/rustls RunSSE path is often peer-closed around ~30s;
 /// Magpie's Node fetch to the same endpoint is not. Soft-continue stitches a
 /// new RunSSE onto the same client stream when that transport cut happens.
-const MAX_STREAM_CONTINUES: u32 = 8;
+const MAX_STREAM_CONTINUES: u32 = 16;
 const CONTINUE_USER: &str = "请从断点处继续输出，不要重复已经写过的内容。";
 
 fn text_of(content: &Value) -> String {

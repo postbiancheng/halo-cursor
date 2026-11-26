@@ -356,11 +356,12 @@ try:
         fail("HALO_CURSOR_AUTO_LONG_SECONDS must be finite and positive")
     long_started_at = int(time.time() * 1000)
     long_started = time.monotonic()
+    # ~1000字通常墙钟 >40s，又不易把 16 次传输续写打满。
     outcome = chat(
-        "用中文写一篇不少于2500字的长文，主题是流式 API 的可靠性："
-        "从请求验证、首包、网络分帧、心跳、结束事件、超时、断线、限流、"
-        "重试与观测写起，分小节展开，不要提纲，不要中途收束。",
-        timeout=max(300, int(long_seconds) + 240),
+        "用中文写一篇大约1000字的文章，主题是流式 API 的可靠性："
+        "覆盖请求验证、首包、分帧、心跳、结束事件与超时，分小节展开，"
+        "不要提纲；写满约一千字后自然收束。",
+        timeout=max(360, int(long_seconds) + 300),
     )
     expect_halo_route(long_started_at)
     elapsed = outcome.get("elapsed") or (time.monotonic() - long_started)

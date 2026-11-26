@@ -25,7 +25,7 @@ Agent2API WASM 插件仓库：https://github.com/postbiancheng/halo-cursor
 - 文本流按 Connect 结束帧判定成功。工具调用根据 Cursor 声明的批次收尾，调用方在下一次请求附上工具结果。流已经输出正文、推理或工具调用时发生错误，按部分输出失败处理。
 - 支持 gzip Connect 帧和分片交付。请求正文限制为 4 MiB，图片等非文本内容返回请求错误。`tool_choice: none` 禁用本轮工具。`max_tokens`、`temperature`、`parallel_tool_calls`、指定工具及强制工具调用目前没有 Cursor 参数映射。
 - RunSSE 不向宿主传 `timeout_ms`（该字段会给上游下载加硬性总期限，长流会被提前掐断）；BidiAppend 仍用 60 秒总期限。也不向 Cursor 发送 `connect-timeout-ms`。长流依赖宿主 stream-idle 与插件自身的首包（60 秒）/空闲（90 秒）检查。
-- 宿主 reqwest/rustls 访问 `RunSSE` 时，上游常在约 30 秒切断连接（同账号下 Magpie/Node fetch 无此现象）。插件在已有正文、无工具调用时会自动开新的 RunSSE 续写，最多 8 次，客户端仍看到同一条流。
+- 宿主 reqwest/rustls 访问 `RunSSE` 时，上游常在约 30 秒切断连接（同账号下 Magpie/Node fetch 无此现象）。插件在已有正文、无工具调用时会自动开新的 RunSSE 续写，最多 16 次，客户端仍看到同一条流。
 - API Key 在到期前可自动兑换新令牌。浏览器登录到期后需要重新授权。
 
 ## 构建
