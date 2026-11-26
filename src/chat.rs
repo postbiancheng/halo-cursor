@@ -607,16 +607,21 @@ pub fn forward(body: Value) -> Result<()> {
                 max_mode = true;
             }
             Ok(AttemptEnd::Continue)
-                if !out.tools_started
-                    && !out.text.is_empty()
-                    && continues < MAX_STREAM_CONTINUES =>
+                if out.started && !out.tools_started && continues < MAX_STREAM_CONTINUES =>
             {
+                // Visible text is preferred, but reasoning-only cuts still resume.
                 let partial = out.text[continued_from..].to_string();
-                if partial.trim().is_empty() {
-                    return Err(Error::http(502, "Cursor 流已输出后中断：无可续写正文")
-                        .with_code("cursor_partial_stream"));
+                if !partial.is_empty() {
+                    push_continue_turn(&mut messages, &partial)?;
+                } else {
+                    messages.push(
+                        serde_json::to_vec(&json!({
+                            "role": "user",
+                            "content": [{"type": "text", "text": CONTINUE_USER}]
+                        }))
+                        .map_err(|_| Error::http(500, "续写上下文编码失败"))?,
+                    );
                 }
-                push_continue_turn(&mut messages, &partial)?;
                 last = CONTINUE_USER.to_string();
                 continued_from = out.text.len();
                 continues += 1;
@@ -765,11 +770,12 @@ fn run_attempt(
     let mut heartbeats = 0_u32;
     let mut turn_ended = false;
     let mut wrote = false;
+    let mut reasoned = false;
     let mut usage = None;
     let mut batch = ToolBatch::default();
     let resumable =
-        |error: Error, wrote: bool, tools_started: bool| -> Result<AttemptEnd> {
-            if wrote && !tools_started && is_resumable_transport_cut(&error) {
+        |error: Error, progressed: bool, tools_started: bool| -> Result<AttemptEnd> {
+            if progressed && !tools_started && is_resumable_transport_cut(&error) {
                 Ok(AttemptEnd::Continue)
             } else {
                 Err(error)
@@ -812,7 +818,11 @@ fn run_attempt(
                     "Cursor RunSSE 读取失败（{elapsed} ms，{heartbeats} 次上行心跳，{turn}）：{}",
                     error.message
                 );
-                return resumable(error, wrote, out.tools_started || !batch.emitted.is_empty());
+                return resumable(
+                    error,
+                    wrote || reasoned || out.started,
+                    out.tools_started || !batch.emitted.is_empty(),
+                );
             }
         };
         let Some(chunk) = chunk else {
@@ -823,7 +833,11 @@ fn run_attempt(
             };
             let error = Error::http(502, format!("Cursor 回复中断（EOF，{detail}）"))
                 .with_code("cursor_stream_eof");
-            return resumable(error, wrote, out.tools_started || !batch.emitted.is_empty());
+            return resumable(
+                error,
+                wrote || reasoned || out.started,
+                out.tools_started || !batch.emitted.is_empty(),
+            );
         };
         if chunk.is_empty() {
             continue;
@@ -871,6 +885,7 @@ fn run_attempt(
                                     let text = proto::pb_str(&fields, 1);
                                     if !text.is_empty() {
                                         wrote |= update.num == 1;
+                                        reasoned |= update.num == 4;
                                         out.delta(if update.num == 1 {
                                             json!({"content":text})
                                         } else {
