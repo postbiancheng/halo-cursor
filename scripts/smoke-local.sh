@@ -341,9 +341,9 @@ def expect_halo_route(started_at):
     fail(f"no halo-cursor request report found for this smoke request; seen={summary}")
 
 
-set_enabled(paused, False)
-ok(f"paused {len(paused)} other chat accounts for auto routing")
 try:
+    set_enabled(paused, False)
+    ok(f"paused {len(paused)} other chat accounts for auto routing")
     chat_started_at = int(time.time() * 1000)
     short = chat("只回：ready", timeout=180)
     expect_halo_route(chat_started_at)

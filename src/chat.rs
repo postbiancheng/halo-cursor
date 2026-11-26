@@ -278,7 +278,9 @@ fn env_bytes() -> Vec<u8> {
         .done()
 }
 
-fn put_blob(blobs: &mut BTreeMap<String, Vec<u8>>, bytes: Vec<u8>) -> [u8; 32] {
+type BlobMap = BTreeMap<String, Vec<u8>>;
+
+fn put_blob(blobs: &mut BlobMap, bytes: Vec<u8>) -> [u8; 32] {
     let id = proto::sha256_raw(&bytes);
     blobs.insert(hex::encode(id), bytes);
     id
@@ -292,7 +294,7 @@ fn build_run(
     conv: &str,
     max_mode: bool,
     params: &[(String, String)],
-) -> Result<(Vec<u8>, BTreeMap<String, Vec<u8>>)> {
+) -> Result<(Vec<u8>, BlobMap)> {
     let mut blobs = BTreeMap::new();
     let mut state = Pb::new();
     for m in msgs {
@@ -373,15 +375,7 @@ fn conversation_id(body: &Value) -> String {
     let mut b = sum[..16].to_vec();
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
-    let h = hex::encode(b);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &h[0..8],
-        &h[8..12],
-        &h[12..16],
-        &h[16..20],
-        &h[20..32]
-    )
+    client::format_uuid(&b)
 }
 
 fn model_params(body: &Value) -> (bool, Vec<(String, String)>) {
@@ -630,9 +624,7 @@ pub fn forward(body: Value) -> Result<()> {
             Ok(AttemptEnd::Continue) => {
                 return Err(Error::http(
                     502,
-                    format!(
-                        "Cursor 流已输出后中断：传输层切断且续写已用尽（{continues} 次）"
-                    ),
+                    format!("Cursor 流已输出后中断：传输层切断且续写已用尽（{continues} 次）"),
                 )
                 .with_code("cursor_partial_stream"));
             }
@@ -734,7 +726,7 @@ fn run_attempt(
     headers: &Value,
     request_id: &str,
     first: &[u8],
-    blobs: &BTreeMap<String, Vec<u8>>,
+    blobs: &BlobMap,
     tools: &[ToolDef],
 ) -> Result<AttemptEnd> {
     let open_body = proto::frame(&Pb::new().str(1, request_id).done());
@@ -773,14 +765,13 @@ fn run_attempt(
     let mut reasoned = false;
     let mut usage = None;
     let mut batch = ToolBatch::default();
-    let resumable =
-        |error: Error, progressed: bool, tools_started: bool| -> Result<AttemptEnd> {
-            if progressed && !tools_started && is_resumable_transport_cut(&error) {
-                Ok(AttemptEnd::Continue)
-            } else {
-                Err(error)
-            }
-        };
+    let resumable = |error: Error, progressed: bool, tools_started: bool| -> Result<AttemptEnd> {
+        if progressed && !tools_started && is_resumable_transport_cut(&error) {
+            Ok(AttemptEnd::Continue)
+        } else {
+            Err(error)
+        }
+    };
 
     loop {
         let now = sdk::now();
@@ -870,19 +861,15 @@ fn run_attempt(
                 return Ok(AttemptEnd::Done);
             }
 
-            let messages =
-                proto::checked_fields(&frame.data).map_err(|error| Error::http(502, error))?;
+            let messages = proto::checked_fields_502(&frame.data)?;
             if !is_heartbeat(&messages) {
                 last_activity = sdk::now();
             }
             for message in messages {
                 match message.num {
                     1 => {
-                        for update in proto::checked_fields(&message.data)
-                            .map_err(|error| Error::http(502, error))?
-                        {
-                            let fields = proto::checked_fields(&update.data)
-                                .map_err(|error| Error::http(502, error))?;
+                        for update in proto::checked_fields_502(&message.data)? {
+                            let fields = proto::checked_fields_502(&update.data)?;
                             match update.num {
                                 1 | 4 => {
                                     let text = proto::pb_str(&fields, 1);
@@ -913,8 +900,7 @@ fn run_attempt(
                         }
                     }
                     2 => {
-                        let exec = proto::checked_fields(&message.data)
-                            .map_err(|error| Error::http(502, error))?;
+                        let exec = proto::checked_fields_502(&message.data)?;
                         if let Some(call) =
                             handle_exec(&exec, tools, &mut seq, headers, request_id)?
                         {
@@ -933,8 +919,7 @@ fn run_attempt(
                         }
                     }
                     3 if batch.expected > 0 && !batch.emitted.is_empty() => {
-                        let pending = proto::checked_fields(&message.data)
-                            .map_err(|error| Error::http(502, error))?
+                        let pending = proto::checked_fields_502(&message.data)?
                             .into_iter()
                             .filter(|field| field.num == 4)
                             .count();
@@ -960,16 +945,16 @@ fn run_attempt(
 
 fn handle_kv(
     data: &[u8],
-    blobs: &BTreeMap<String, Vec<u8>>,
+    blobs: &BlobMap,
     seq: &mut u64,
     headers: &Value,
     request_id: &str,
 ) -> Result<()> {
-    let kv = proto::checked_fields(data).map_err(|error| Error::http(502, error))?;
+    let kv = proto::checked_fields_502(data)?;
     let id = proto::pb_num(&kv, 1);
     for k in &kv {
         if k.num == 2 {
-            let fields = proto::checked_fields(&k.data).map_err(|error| Error::http(502, error))?;
+            let fields = proto::checked_fields_502(&k.data)?;
             let want = proto::field(&fields, 1)
                 .map(|field| hex::encode(&field.data))
                 .unwrap_or_default();
@@ -1031,14 +1016,13 @@ fn handle_exec(
     for e in es {
         match e.num {
             11 => {
-                let a = proto::checked_fields(&e.data).map_err(|error| Error::http(502, error))?;
+                let a = proto::checked_fields_502(&e.data)?;
                 let mut args = serde_json::Map::new();
                 for kv in &a {
                     if kv.num != 2 {
                         continue;
                     }
-                    let ef =
-                        proto::checked_fields(&kv.data).map_err(|error| Error::http(502, error))?;
+                    let ef = proto::checked_fields_502(&kv.data)?;
                     let key = proto::pb_str(&ef, 1);
                     let value = match proto::field(&ef, 2) {
                         Some(value) => proto::pb_any(&value.data)

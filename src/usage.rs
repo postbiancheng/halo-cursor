@@ -109,9 +109,7 @@ fn on_demand_of(data: &Value, hard: Option<&Value>) -> OnDemand {
     let used_dollars = number(s.and_then(|v| v.get("individualUsed"))).unwrap_or(0.0) / 100.0;
 
     let own = s.and_then(|v| {
-        if v.get("individualLimit").is_none() {
-            return None;
-        }
+        v.get("individualLimit")?;
         let limit = number(v.get("individualLimit")).unwrap_or(0.0);
         if limit > 0.0 {
             Some(OnDemand::Fixed {
@@ -135,7 +133,8 @@ fn on_demand_of(data: &Value, hard: Option<&Value>) -> OnDemand {
         }
         if let Some(h) = hard {
             let blocked = boolish(h.get("noUsageBasedAllowed")).unwrap_or(false)
-                || !(number(h.get("hardLimit")).unwrap_or(0.0) > 0.0);
+                || number(h.get("hardLimit")).unwrap_or(0.0).partial_cmp(&0.0)
+                    != Some(std::cmp::Ordering::Greater);
             if blocked {
                 return OnDemand::Disabled { used_dollars };
             }
@@ -178,16 +177,27 @@ fn on_demand_of(data: &Value, hard: Option<&Value>) -> OnDemand {
     }
 }
 
-fn push_percent_window(
-    windows: &mut Vec<Value>,
-    wallets: &mut Vec<Value>,
-    sources: &mut Vec<Value>,
-    name: &str,
+struct PercentWindow<'a> {
+    name: &'a str,
     used: f64,
     resets_at: Option<i64>,
     aside: bool,
     display: Option<String>,
+}
+
+fn push_percent_window(
+    windows: &mut Vec<Value>,
+    wallets: &mut Vec<Value>,
+    sources: &mut Vec<Value>,
+    window: PercentWindow<'_>,
 ) {
+    let PercentWindow {
+        name,
+        used,
+        resets_at,
+        aside,
+        display,
+    } = window;
     let used = used.clamp(0.0, 100.0);
     let remaining = (100.0 - used).max(0.0);
     let mut row = json!({
@@ -262,21 +272,25 @@ fn parse(
             &mut windows,
             &mut wallets,
             &mut sources,
-            "Cursor Models",
-            auto,
-            resets_at,
-            false,
-            None,
+            PercentWindow {
+                name: "Cursor Models",
+                used: auto,
+                resets_at,
+                aside: false,
+                display: None,
+            },
         );
         push_percent_window(
             &mut windows,
             &mut wallets,
             &mut sources,
-            "Other Models",
-            api,
-            resets_at,
-            false,
-            None,
+            PercentWindow {
+                name: "Other Models",
+                used: api,
+                resets_at,
+                aside: false,
+                display: None,
+            },
         );
 
         match &od {
@@ -286,11 +300,8 @@ fn parse(
                 mine_dollars,
             } if *limit_dollars > 0.0 => {
                 let used_pct = ((*used_dollars / *limit_dollars) * 100.0).clamp(0.0, 100.0);
-                let mut display = format!(
-                    "{} / {}",
-                    dollars(*used_dollars),
-                    dollars(*limit_dollars)
-                );
+                let mut display =
+                    format!("{} / {}", dollars(*used_dollars), dollars(*limit_dollars));
                 if let Some(mine) = mine_dollars {
                     display.push_str(&format!(" (you: {})", dollars(*mine)));
                 }
@@ -298,11 +309,13 @@ fn parse(
                     &mut windows,
                     &mut wallets,
                     &mut sources,
-                    "On-demand",
-                    used_pct,
-                    resets_at,
-                    od_aside,
-                    Some(display),
+                    PercentWindow {
+                        name: "On-demand",
+                        used: used_pct,
+                        resets_at,
+                        aside: od_aside,
+                        display: Some(display),
+                    },
                 );
             }
             OnDemand::Unlimited { used_dollars } => {
@@ -310,11 +323,13 @@ fn parse(
                     &mut windows,
                     &mut wallets,
                     &mut sources,
-                    "On-demand",
-                    0.0,
-                    resets_at,
-                    true,
-                    Some(dollars(*used_dollars)),
+                    PercentWindow {
+                        name: "On-demand",
+                        used: 0.0,
+                        resets_at,
+                        aside: true,
+                        display: Some(dollars(*used_dollars)),
+                    },
                 );
             }
             _ => {}
@@ -326,11 +341,13 @@ fn parse(
                 &mut windows,
                 &mut wallets,
                 &mut sources,
-                &name,
-                bot.used,
-                bot.resets_at,
-                true,
-                None,
+                PercentWindow {
+                    name: &name,
+                    used: bot.used,
+                    resets_at: bot.resets_at,
+                    aside: true,
+                    display: None,
+                },
             );
         }
 
@@ -343,11 +360,13 @@ fn parse(
             &mut windows,
             &mut wallets,
             &mut sources,
-            "Total",
-            total,
-            resets_at,
-            true,
-            None,
+            PercentWindow {
+                name: "Total",
+                used: total,
+                resets_at,
+                aside: true,
+                display: None,
+            },
         );
 
         if credit_rows.is_empty() {
@@ -401,11 +420,13 @@ fn parse(
             &mut windows,
             &mut wallets,
             &mut sources,
-            &bot.name,
-            bot.used,
-            bot.resets_at,
-            true,
-            None,
+            PercentWindow {
+                name: &bot.name,
+                used: bot.used,
+                resets_at: bot.resets_at,
+                aside: true,
+                display: None,
+            },
         );
     }
     let _ = build_credits(None, grants, resets_at, now, &mut credit_rows, &mut wallets);
@@ -484,7 +505,10 @@ fn build_credits(
     for g in grants {
         let total = number(g.get("totalCents")).unwrap_or(0.0) / 100.0;
         let left = number(g.get("remainingCents")).unwrap_or(0.0).max(0.0) / 100.0;
-        if !(total > 0.0) || !total.is_finite() || !left.is_finite() {
+        if total.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+            || !total.is_finite()
+            || !left.is_finite()
+        {
             continue;
         }
         let exp = number(g.get("expiresAtMs")).unwrap_or(0.0) as i64;

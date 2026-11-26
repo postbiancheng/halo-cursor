@@ -99,7 +99,8 @@ fn enrich(
     let expires = if expires_at > 0 {
         expires_at
     } else {
-        client::jwt_exp_ms(access).unwrap_or_else(|| sdk::now().saturating_add(60 * 24 * 3600_000))
+        client::jwt_exp_ms(access)
+            .unwrap_or_else(|| sdk::now().saturating_add(client::OAUTH_FALLBACK_TTL_MS))
     };
     Ok(secret_from_access(
         access, refresh, api_key, &email, &plan, expires,
@@ -263,8 +264,8 @@ pub fn poll() -> Result<Value> {
         return Err(Error::http(502, "Cursor 未返回 refresh token 字段"));
     }
     let refresh = body["refreshToken"].as_str();
-    let expires =
-        client::jwt_exp_ms(access).unwrap_or_else(|| sdk::now().saturating_add(60 * 24 * 3600_000));
+    let expires = client::jwt_exp_ms(access)
+        .unwrap_or_else(|| sdk::now().saturating_add(client::OAUTH_FALLBACK_TTL_MS));
     let secret = enrich(access, refresh, None, expires)?;
     Ok(login::done(super::normalized(secret)))
 }

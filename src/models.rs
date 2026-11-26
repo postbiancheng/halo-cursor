@@ -147,12 +147,12 @@ fn default_variant<'a>(
     variants
         .iter()
         .copied()
-        .find(|v| v["isDefaultNonMaxConfig"] == true && stable(&v))
+        .find(|v| v["isDefaultNonMaxConfig"] == true && stable(v))
         .or_else(|| {
             variants
                 .iter()
                 .copied()
-                .find(|v| v["isDefaultMaxConfig"] == true && stable(&v))
+                .find(|v| v["isDefaultMaxConfig"] == true && stable(v))
         })
         .or_else(|| variants.iter().copied().find(stable))
         .or_else(|| {
@@ -430,103 +430,6 @@ fn parse_models(body: &Value, usable: Option<&std::collections::BTreeSet<String>
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn maps_default_model_to_auto_with_run_id() {
-        let models = parse_models(
-            &json!({
-                "models": [{
-                    "name": "default",
-                    "clientDisplayName": "Auto",
-                    "contextTokenLimit": 200000,
-                    "supportsAgent": true,
-                    "variants": [{
-                        "legacySlug": "default",
-                        "isDefaultNonMaxConfig": true
-                    }]
-                }, {
-                    "name": "grok-4.6",
-                    "clientDisplayName": "Grok 4.6",
-                    "contextTokenLimit": 256000,
-                    "supportsAgent": true,
-                    "variants": [{
-                        "legacySlug": "cursor-grok-4.6-high-fast",
-                        "isDefaultNonMaxConfig": true
-                    }, {
-                        "legacySlug": "grok-4.6-high"
-                    }]
-                }, {
-                    "name": "claude-haiku-4-5",
-                    "clientDisplayName": "Claude Haiku 4.5",
-                    "contextTokenLimit": 200000,
-                    "supportsAgent": true,
-                    "variants": [{
-                        "legacySlug": "claude-4.5-haiku-thinking",
-                        "isDefaultNonMaxConfig": true
-                    }, {
-                        "legacySlug": "claude-4.5-haiku"
-                    }]
-                }]
-            }),
-            None,
-        );
-        assert_eq!(models[0]["id"], "auto");
-        assert_eq!(models[0]["runId"], "default");
-        assert_eq!(models[0]["supportsToolCall"], true);
-        assert_eq!(models[0]["supportsImages"], false);
-        assert_eq!(models[0]["maxInputTokens"], 200000);
-        assert_eq!(models[1]["id"], "grok-4.6");
-        assert_eq!(models[1]["supportsToolCall"], true);
-        // Prefer non-fast even when Magpie default is the fast SKU.
-        assert_eq!(models[1]["runId"], "grok-4.6-high");
-        assert_eq!(models[2]["id"], "claude-haiku-4-5");
-        assert_eq!(models[2]["runId"], "claude-4.5-haiku");
-
-        let mut usable = std::collections::BTreeSet::new();
-        usable.insert("composer-2.5".into());
-        usable.insert("composer-2.5-fast".into());
-        let models = parse_models(
-            &json!({
-                "models": [{
-                    "name": "composer-2.5",
-                    "clientDisplayName": "Composer 2.5",
-                    "supportsAgent": true,
-                    "variants": [{
-                        "legacySlug": "composer-2.5-fast",
-                        "isDefaultNonMaxConfig": true
-                    }]
-                }]
-            }),
-            Some(&usable),
-        );
-        assert_eq!(models[0]["runId"], "composer-2.5");
-    }
-
-    #[test]
-    fn run_mapping_prefers_exact_variant() {
-        let rows = [
-            json!({"id":"model","runId":"normal"}),
-            json!({"id":"model@1m","runId":"long","maxMode":true}),
-        ];
-        assert_eq!(
-            run_from_models(&rows, "model@1m", "model", "model"),
-            Some(("long".into(), true))
-        );
-    }
-
-    #[test]
-    fn resolve_run_maps_auto_without_catalog() {
-        let (id, max) = resolve_run("auto", &Value::Null);
-        assert_eq!(id, "default");
-        assert!(!max);
-        let (id, _) = resolve_run("composer-2.5@200k", &Value::Null);
-        assert_eq!(id, "composer-2.5");
-    }
-}
-
 fn parse_context_tokens(ctx: &str) -> Option<i64> {
     let lower = ctx.to_ascii_lowercase();
     if let Some(num) = lower.strip_suffix('k') {
@@ -650,4 +553,101 @@ pub fn refresh(params: &Value) -> Result<Value> {
         }
     }
     Err(Error::http(409, "保存 Cursor 模型目录时发生并发更新"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_default_model_to_auto_with_run_id() {
+        let models = parse_models(
+            &json!({
+                "models": [{
+                    "name": "default",
+                    "clientDisplayName": "Auto",
+                    "contextTokenLimit": 200000,
+                    "supportsAgent": true,
+                    "variants": [{
+                        "legacySlug": "default",
+                        "isDefaultNonMaxConfig": true
+                    }]
+                }, {
+                    "name": "grok-4.6",
+                    "clientDisplayName": "Grok 4.6",
+                    "contextTokenLimit": 256000,
+                    "supportsAgent": true,
+                    "variants": [{
+                        "legacySlug": "cursor-grok-4.6-high-fast",
+                        "isDefaultNonMaxConfig": true
+                    }, {
+                        "legacySlug": "grok-4.6-high"
+                    }]
+                }, {
+                    "name": "claude-haiku-4-5",
+                    "clientDisplayName": "Claude Haiku 4.5",
+                    "contextTokenLimit": 200000,
+                    "supportsAgent": true,
+                    "variants": [{
+                        "legacySlug": "claude-4.5-haiku-thinking",
+                        "isDefaultNonMaxConfig": true
+                    }, {
+                        "legacySlug": "claude-4.5-haiku"
+                    }]
+                }]
+            }),
+            None,
+        );
+        assert_eq!(models[0]["id"], "auto");
+        assert_eq!(models[0]["runId"], "default");
+        assert_eq!(models[0]["supportsToolCall"], true);
+        assert_eq!(models[0]["supportsImages"], false);
+        assert_eq!(models[0]["maxInputTokens"], 200000);
+        assert_eq!(models[1]["id"], "grok-4.6");
+        assert_eq!(models[1]["supportsToolCall"], true);
+        // Prefer non-fast even when Magpie default is the fast SKU.
+        assert_eq!(models[1]["runId"], "grok-4.6-high");
+        assert_eq!(models[2]["id"], "claude-haiku-4-5");
+        assert_eq!(models[2]["runId"], "claude-4.5-haiku");
+
+        let mut usable = std::collections::BTreeSet::new();
+        usable.insert("composer-2.5".into());
+        usable.insert("composer-2.5-fast".into());
+        let models = parse_models(
+            &json!({
+                "models": [{
+                    "name": "composer-2.5",
+                    "clientDisplayName": "Composer 2.5",
+                    "supportsAgent": true,
+                    "variants": [{
+                        "legacySlug": "composer-2.5-fast",
+                        "isDefaultNonMaxConfig": true
+                    }]
+                }]
+            }),
+            Some(&usable),
+        );
+        assert_eq!(models[0]["runId"], "composer-2.5");
+    }
+
+    #[test]
+    fn run_mapping_prefers_exact_variant() {
+        let rows = [
+            json!({"id":"model","runId":"normal"}),
+            json!({"id":"model@1m","runId":"long","maxMode":true}),
+        ];
+        assert_eq!(
+            run_from_models(&rows, "model@1m", "model", "model"),
+            Some(("long".into(), true))
+        );
+    }
+
+    #[test]
+    fn resolve_run_maps_auto_without_catalog() {
+        let (id, max) = resolve_run("auto", &Value::Null);
+        assert_eq!(id, "default");
+        assert!(!max);
+        let (id, _) = resolve_run("composer-2.5@200k", &Value::Null);
+        assert_eq!(id, "composer-2.5");
+    }
 }

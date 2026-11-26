@@ -69,6 +69,10 @@ pub fn fields(input: &[u8]) -> Vec<Field> {
     checked_fields(input).unwrap_or_default()
 }
 
+pub fn checked_fields_502(input: &[u8]) -> agent2api_wasm_sdk::Result<Vec<Field>> {
+    checked_fields(input).map_err(|error| agent2api_wasm_sdk::Error::http(502, error))
+}
+
 pub fn checked_fields(input: &[u8]) -> Result<Vec<Field>, &'static str> {
     const MALFORMED: &str = "Cursor Protobuf 字段无效";
     let mut out = Vec::new();
@@ -151,7 +155,7 @@ pub fn checked_fields(input: &[u8]) -> Result<Vec<Field>, &'static str> {
     Ok(out)
 }
 
-pub fn field<'a>(fs: &'a [Field], num: u32) -> Option<&'a Field> {
+pub fn field(fs: &[Field], num: u32) -> Option<&Field> {
     fs.iter().find(|f| f.num == num)
 }
 

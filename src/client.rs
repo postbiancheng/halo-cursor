@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 
 pub const API: &str = "https://api2.cursor.sh";
 pub const WEBSITE: &str = "https://cursor.com";
+pub const OAUTH_FALLBACK_TTL_MS: i64 = 60 * 24 * 3_600_000;
+const API_KEY_FALLBACK_TTL_MS: i64 = 30 * 24 * 3_600_000;
 #[allow(dead_code)]
 pub const AGENT_FALLBACK: &str = "https://agentn.global.api5.cursor.sh";
 
@@ -24,19 +26,23 @@ pub fn random_bytes(len: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub fn uuid_v4() -> Result<String> {
-    let mut bytes = random_bytes(16)?;
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+pub fn format_uuid(bytes: &[u8]) -> String {
     let h = hex::encode(bytes);
-    Ok(format!(
+    format!(
         "{}-{}-{}-{}-{}",
         &h[0..8],
         &h[8..12],
         &h[12..16],
         &h[16..20],
         &h[20..32]
-    ))
+    )
+}
+
+pub fn uuid_v4() -> Result<String> {
+    let mut bytes = random_bytes(16)?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(format_uuid(&bytes))
 }
 
 pub fn base64url(bytes: &[u8]) -> String {
@@ -137,7 +143,7 @@ pub fn session_user_id(token: &str) -> Option<String> {
     let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let claims: Value = serde_json::from_slice(&decoded).ok()?;
     let sub = claims.get("sub")?.as_str()?;
-    let user = sub.split('|').filter(|s| !s.is_empty()).next_back()?;
+    let user = sub.split('|').rfind(|s| !s.is_empty())?;
     if user.is_empty()
         || !user
             .chars()
@@ -231,6 +237,6 @@ pub fn exchange_api_key(api_key: &str) -> Result<(String, i64)> {
         .ok_or_else(|| Error::http(401, "Cursor 未返回 access token"))?
         .to_string();
     let expires =
-        jwt_exp_ms(&access).unwrap_or_else(|| sdk::now().saturating_add(30 * 24 * 3600_000));
+        jwt_exp_ms(&access).unwrap_or_else(|| sdk::now().saturating_add(API_KEY_FALLBACK_TTL_MS));
     Ok((access, expires))
 }

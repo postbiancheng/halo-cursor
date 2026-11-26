@@ -13,9 +13,22 @@ jobs:
         with:
           node-version: '22'
       - run: rustup target add wasm32-unknown-unknown
+      - run: rustup component add clippy rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo build --locked --release --target wasm32-unknown-unknown
       - run: node --test tests/forward-wasm.mjs
-      - run: |
+      - name: Check package metadata and scripts
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs")
+          const cargo = fs.readFileSync("Cargo.toml", "utf8")
+          const version = cargo.match(/^version = "([^"]+)"$/m)?.[1]
+          const pack = JSON.parse(fs.readFileSync("pack.json", "utf8"))
+          if (!version || version !== pack.version) {
+            throw new Error(`Cargo.toml version ${version} != pack.json version ${pack.version}`)
+          }
+          NODE
           bash -n scripts/pack.sh
           bash -n scripts/smoke-local.sh
