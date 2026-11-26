@@ -840,6 +840,9 @@ fn run_attempt(
             );
         };
         if chunk.is_empty() {
+            // An empty read is not upstream progress and does not replenish the
+            // host fuel window. Back off instead of spinning until it is exhausted.
+            sdk::sleep(50)?;
             continue;
         }
 

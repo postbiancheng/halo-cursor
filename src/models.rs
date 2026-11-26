@@ -81,14 +81,14 @@ fn model(id: &str, name: &str, limit: i64, run_id: Option<&str>, max_mode: bool)
         "kind": "chat",
         "provider": PROVIDER,
         "supportsToolCall": true,
-        "supportsImages": true,
+        "supportsImages": false,
         "maxInputTokens": limit,
         "maxOutputTokens": 128000,
         "capabilities": {
             "maxInputTokens": limit,
             "maxOutputTokens": 128000,
             "supportsToolCall": true,
-            "supportsImages": true,
+            "supportsImages": false,
             "supportsTools": true
         }
     });
@@ -476,7 +476,7 @@ mod tests {
         assert_eq!(models[0]["id"], "auto");
         assert_eq!(models[0]["runId"], "default");
         assert_eq!(models[0]["supportsToolCall"], true);
-        assert_eq!(models[0]["supportsImages"], true);
+        assert_eq!(models[0]["supportsImages"], false);
         assert_eq!(models[0]["maxInputTokens"], 200000);
         assert_eq!(models[1]["id"], "grok-4.6");
         assert_eq!(models[1]["supportsToolCall"], true);

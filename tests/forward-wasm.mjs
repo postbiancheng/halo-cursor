@@ -75,6 +75,10 @@ function hostRun(scenario) {
       case "clock.now":
         result = 1_700_000_000_000 + tick
         break
+      case "clock.sleep":
+        assert.equal(params.milliseconds, 50)
+        tick += params.milliseconds
+        break
       case "state.get":
         result = {revision: 0, schema: 1, compatible: true, value: null}
         break
@@ -169,6 +173,14 @@ function hostRun(scenario) {
     frames: events.filter((line) => !line.includes("[DONE]")).map((line) => JSON.parse(line.slice(6))),
   }
 }
+
+test("empty reads back off instead of spinning until the fuel window is exhausted", () => {
+  const run = hostRun({attempts: [{chunks: [Buffer.alloc(0), Buffer.alloc(0), content("ok"), end()]}]})
+  assert.equal(run.done, true)
+  assert.equal(run.frames.at(-1).choices[0].finish_reason, "stop")
+  assert.equal(run.calls.filter((method) => method === "clock.sleep").length, 2)
+  assert.equal(run.elapsed, 100)
+})
 
 test("normal completion preserves trailing usage and supports arbitrary framing", () => {
   const data = concat(content("hello"), usage, end({metadata: {}}))
