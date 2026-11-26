@@ -57,7 +57,7 @@ Agent2API WASM 插件仓库：https://github.com/postbiancheng/halo-cursor
 python3 - <<'PY'
 import base64, json, urllib.request, os
 key = os.environ["AGENT2API_API_KEY"]
-zip_path = "dist/agent2api-wasm-halo-cursor-0.1.7.zip"
+zip_path = "dist/agent2api-wasm-halo-cursor-0.1.8.zip"
 body = json.dumps({"packB64": base64.b64encode(open(zip_path, "rb").read()).decode()}).encode()
 req = urllib.request.Request(
     "http://127.0.0.1:3065/api/plugins/install",
@@ -71,6 +71,7 @@ PY
 
 ## 版本摘要
 
+- **0.1.8**：移除额度展示中的 Free usage 和 Total 冗余条目，保留免费额度可用性判断。
 - **0.1.7**：整理共享代码与额度参数结构，修复冒烟账号恢复窗口，并加强格式、静态检查及版本一致性 CI。
 - **0.1.6**：RunSSE 空块读取增加短暂退避，避免忙等耗尽 WASM 燃料窗口。
 - **0.1.5**：模型目录明确声明不支持图片，与文本请求校验保持一致，避免图片请求被错误路由到 Cursor。

@@ -250,7 +250,7 @@ fn parse(
     let now = agent2api_wasm_sdk::now();
 
     let od = on_demand_of(data, hard);
-    let free = build_credits(u, grants, resets_at, now, &mut credit_rows, &mut wallets);
+    let free = build_credits(u, grants, now, &mut credit_rows, &mut wallets);
     let od_open = matches!(
         &od,
         OnDemand::Fixed {
@@ -263,8 +263,6 @@ fn parse(
     if let Some(u) = u {
         let auto = number(u.get("autoPercentUsed")).unwrap_or(0.0);
         let api = number(u.get("apiPercentUsed")).unwrap_or(0.0);
-        let total = number(u.get("totalPercentUsed")).unwrap_or(auto.max(api));
-
         // When free credit covers every model, Magpie treats on-demand as aside.
         let od_aside = free.all || matches!(od, OnDemand::Unlimited { .. });
 
@@ -351,23 +349,9 @@ fn parse(
             );
         }
 
-        // Free-credit windows (aside) sit with Grok Bot before Total.
         for row in &free.aside_windows {
             windows.push(row.clone());
         }
-
-        push_percent_window(
-            &mut windows,
-            &mut wallets,
-            &mut sources,
-            PercentWindow {
-                name: "Total",
-                used: total,
-                resets_at,
-                aside: true,
-                display: None,
-            },
-        );
 
         if credit_rows.is_empty() {
             credit_rows.push(json!({ "name": "赠金", "remain": 0.0, "unit": "credits" }));
@@ -429,7 +413,7 @@ fn parse(
             },
         );
     }
-    let _ = build_credits(None, grants, resets_at, now, &mut credit_rows, &mut wallets);
+    let _ = build_credits(None, grants, now, &mut credit_rows, &mut wallets);
     if credit_rows.is_empty() {
         credit_rows.push(json!({ "name": "赠金", "remain": 0.0, "unit": "credits" }));
     }
@@ -454,53 +438,12 @@ struct FreeCredit {
 fn build_credits(
     plan: Option<&Value>,
     grants: &[Value],
-    resets_at: Option<i64>,
     now: i64,
     credit_rows: &mut Vec<Value>,
     wallets: &mut Vec<Value>,
 ) -> FreeCredit {
     let mut aside_windows = Vec::new();
-    let mut all = false;
-
-    let bonus_spend = number(plan.and_then(|p| p.get("bonusSpend"))).unwrap_or(0.0) / 100.0;
-    let remaining_bonus = boolish(plan.and_then(|p| p.get("remainingBonus"))).unwrap_or(false);
-    if bonus_spend > 0.0 || remaining_bonus {
-        let display = format!(
-            "+{} on us{}",
-            dollars(bonus_spend),
-            if remaining_bonus { ", more left" } else { "" }
-        );
-        let mut win = json!({
-            "name": "Free usage",
-            "usedPercent": 0.0,
-            "remainingPercent": if remaining_bonus { 100.0 } else { 0.0 },
-            "window": "Free usage",
-            "aside": true,
-            "display": display,
-            "unit": "USD",
-        });
-        if let Some(ms) = resets_at {
-            win["resetsAt"] = json!(ms);
-        }
-        aside_windows.push(win);
-        credit_rows.push(json!({
-            "name": "Free usage",
-            "remain": if remaining_bonus { Value::Null } else { json!(0.0) },
-            "display": format!("+{} on us{}", dollars(bonus_spend), if remaining_bonus { ", more left" } else { "" }),
-            "unit": "USD",
-            "aside": true,
-        }));
-        if remaining_bonus {
-            all = true;
-            wallets.push(json!({
-                "type": "credits",
-                "displayName": "Free usage",
-                "balance": Value::Null,
-                "unit": "USD",
-                "aside": true,
-            }));
-        }
-    }
+    let mut all = boolish(plan.and_then(|p| p.get("remainingBonus"))).unwrap_or(false);
 
     for g in grants {
         let total = number(g.get("totalCents")).unwrap_or(0.0) / 100.0;
@@ -676,7 +619,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_included_pools_and_aside_total() {
+    fn parses_included_pools_without_total() {
         let report = parse(
             &json!({
                 "billingCycleEnd": "1800000000",
@@ -698,13 +641,15 @@ mod tests {
         assert_eq!(report["windows"][0]["name"], "Cursor Models");
         assert_eq!(report["windows"][0]["remainingPercent"], json!(75.0));
         assert_eq!(report["windows"][1]["name"], "Other Models");
-        let total = report["windows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|w| w["name"] == "Total")
-            .unwrap();
-        assert_eq!(total["aside"], true);
+        for field in ["windows", "wallets", "quotaSources"] {
+            assert!(report[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["name"] != "Total"
+                    && row["displayName"] != "Total"
+                    && row["label"] != "Total"));
+        }
         assert_eq!(report["subscription"]["planName"], "Pro+");
     }
 
@@ -781,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn surfaces_grok_bot_aside_and_free_usage() {
+    fn surfaces_grok_bot_without_free_usage_rows() {
         let report = parse(
             &json!({
                 "billingCycleEnd": "1800000000",
@@ -811,13 +756,13 @@ mod tests {
             .unwrap();
         assert_eq!(bot["aside"], true);
         assert_eq!(bot["remainingPercent"], json!(60.0));
-        let free = report["credits"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "Free usage")
-            .unwrap();
-        assert!(free["display"].as_str().unwrap().contains("$12.34"));
+        for field in ["windows", "wallets", "quotaSources", "credits"] {
+            assert!(report[field].as_array().unwrap().iter().all(|row| {
+                row["name"] != "Free usage"
+                    && row["displayName"] != "Free usage"
+                    && row["label"] != "Free usage"
+            }));
+        }
     }
 
     #[test]

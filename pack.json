@@ -2,7 +2,7 @@
   "id": "agent2api-wasm-halo-cursor",
   "name": "Halo Cursor",
   "description": "Cursor 订阅的 Deep Control 登录、对话转发与用量查询",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "protocol": 1,
   "providers": [
     { "id": "halo-cursor", "label": "Halo Cursor", "order": 47, "default_enabled": true }
