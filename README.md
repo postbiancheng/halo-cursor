@@ -25,7 +25,7 @@ Agent2API WASM 插件仓库：https://github.com/postbiancheng/halo-cursor
 - 文本流按 Connect 结束帧判定成功。工具调用根据 Cursor 声明的批次收尾，调用方在下一次请求附上工具结果。流已经输出正文、推理或工具调用时发生错误，按部分输出失败处理。
 - 支持 gzip Connect 帧和分片交付。请求正文限制为 4 MiB，图片等非文本内容返回请求错误。`tool_choice: none` 禁用本轮工具。`max_tokens`、`temperature`、`parallel_tool_calls`、指定工具及强制工具调用目前没有 Cursor 参数映射。
 - RunSSE 不向宿主传 `timeout_ms`（该字段会给上游下载加硬性总期限，长流会被提前掐断）；BidiAppend 仍用 60 秒总期限。也不向 Cursor 发送 `connect-timeout-ms`。空块读取采用 50ms 至 1 秒的指数退避，收到数据后恢复短间隔，避免无上游进展时忙等耗尽 WASM 燃料窗口。长流依赖宿主 stream-idle 与插件自身的首包（60 秒）/空闲（90 秒）检查。
-- 宿主 reqwest/rustls 访问 `RunSSE` 时，上游常在约 30 秒切断连接（同账号下 Magpie/Node fetch 无此现象）。插件在已有正文、无工具调用时会自动开新的 RunSSE 续写，最多 16 次，客户端仍看到同一条流。
+- 宿主 reqwest/rustls 访问 `RunSSE` 时，上游常在约 30 秒切断连接（同账号下 Magpie/Node fetch 无此现象）。插件在已有输出、无工具调用时会自动开新的 RunSSE 续写，最多 16 次，客户端仍看到同一条流。续写复用已编码的历史消息和工具描述，减少 Wasm 计算消耗。
 - API Key 在到期前可自动兑换新令牌。浏览器登录到期后需要重新授权。
 
 ## 构建
@@ -44,7 +44,7 @@ Agent2API WASM 插件仓库：https://github.com/postbiancheng/halo-cursor
 ./scripts/smoke-local.sh
 ```
 
-在能将 `auto` 路由到 Halo Cursor 的实例上运行。脚本通过请求记录分别核对短测和长测的提供商。两条流都必须收到正文、结束原因和 `[DONE]`。长流从第一条到最后一条正文增量默认至少 40 秒，可用 `HALO_CURSOR_AUTO_LONG_SECONDS` 调整。脚本记录首个正文的耗时。
+脚本默认使用 `cursor/auto`，该路由组应仅包含 Halo Cursor 的 `auto` 模型。可用 `HALO_CURSOR_SMOKE_MODEL` 指定实例上对应的路由组。脚本通过请求记录分别核对短测和长测的提供商和账号。两条流都必须收到正文、结束原因和 `[DONE]`。长流从第一条到最后一条正文增量默认至少 40 秒，可用 `HALO_CURSOR_AUTO_LONG_SECONDS` 调整。脚本记录首个正文的耗时。
 
 离线回归可用 `cargo test --locked`，构建 WASM 后运行 `node --test tests/forward-wasm.mjs`。
 
@@ -57,7 +57,7 @@ Agent2API WASM 插件仓库：https://github.com/postbiancheng/halo-cursor
 python3 - <<'PY'
 import base64, json, urllib.request, os
 key = os.environ["AGENT2API_API_KEY"]
-zip_path = "dist/agent2api-wasm-halo-cursor-0.1.9.zip"
+zip_path = "dist/agent2api-wasm-halo-cursor-0.1.10.zip"
 body = json.dumps({"packB64": base64.b64encode(open(zip_path, "rb").read()).decode()}).encode()
 req = urllib.request.Request(
     "http://127.0.0.1:3065/api/plugins/install",
@@ -71,6 +71,7 @@ PY
 
 ## 版本摘要
 
+- **0.1.10**：断线续写复用历史消息哈希和工具定义，区分宿主计算额度与账号用量；冒烟测试走独立路由，移除账号开关操作。
 - **0.1.9**：长思考空读采用指数退避并限制为每秒一次，收到上游数据后恢复短间隔，避免长流耗尽 WASM fuel。
 - **0.1.8**：移除额度展示中的 Free usage 和 Total 冗余条目，保留免费额度可用性判断。
 - **0.1.7**：整理共享代码与额度参数结构，修复冒烟账号恢复窗口，并加强格式、静态检查及版本一致性 CI。

@@ -15,6 +15,7 @@ HOST = os.environ["AGENT2API_HOST"].rstrip("/")
 EXPECT = os.environ["HALO_CURSOR_EXPECTED_VERSION"]
 PROVIDER = "halo-cursor"
 PACK = "agent2api-wasm-halo-cursor"
+CHAT_MODEL = os.environ.get("HALO_CURSOR_SMOKE_MODEL", "cursor/auto")
 
 key = os.environ.get("AGENT2API_API_KEY")
 cfg = pathlib.Path.home() / ".agent2api" / "config.json"
@@ -125,7 +126,6 @@ def read_sse(response, started):
                     if outcome["finish"] is not None:
                         raise ValueError("repeated finish_reason")
                     outcome["finish"] = finish
-    outcome["elapsed"] = time.monotonic() - started
     if outcome["first_content"] is not None:
         outcome["content_span"] = last_content - outcome["first_content"]
     return outcome
@@ -257,35 +257,13 @@ ok(
     f"credits={bool(last.get('credits'))}"
 )
 
-# Host may hand bare `auto` to higher-priority allowRouteSkip accounts even when
-# they do not advertise that model. Park them for the chat portion only.
-paused = [
-    item["id"]
-    for item in ((accounts.get("data") or accounts).get("accounts") or [])
-    if item.get("enabled")
-    and item.get("id") != account_id
-    and item.get("chatSupported") is not False
-]
-
-
-def set_enabled(account_ids, enabled):
-    for item_id in account_ids:
-        status, _ = call(
-            "PATCH",
-            f"/api/accounts/{item_id}",
-            {"enabled": enabled},
-            timeout=30,
-        )
-        if status != 200:
-            fail(f"account {'enable' if enabled else 'pause'} HTTP {status} for {item_id}")
-
 
 def chat(prompt, timeout):
     status, outcome = call(
         "POST",
         "/v1/chat/completions",
         {
-            "model": "auto",
+            "model": CHAT_MODEL,
             "accountId": account_id,
             "stream": True,
             "messages": [{"role": "user", "content": prompt}],
@@ -338,52 +316,37 @@ def expect_halo_route(started_at):
         f"{item.get('provider')}:{item.get('status')}:{item.get('model')}"
         for item in last_entries[:8]
     ]
-    fail(f"no halo-cursor request report found for this smoke request; seen={summary}")
+    fail(f"{CHAT_MODEL} did not route to the selected Halo Cursor account; seen={summary}")
 
 
-try:
-    set_enabled(paused, False)
-    ok(f"paused {len(paused)} other chat accounts for auto routing")
-    chat_started_at = int(time.time() * 1000)
-    short = chat("只回：ready", timeout=180)
-    expect_halo_route(chat_started_at)
-    ok(f"short auto chat, TTFT={short['first_content']:.2f}s, {short['events']} content deltas")
+chat_started_at = int(time.time() * 1000)
+short = chat("只回：ready", timeout=180)
+expect_halo_route(chat_started_at)
+ok(f"short {CHAT_MODEL} chat, TTFT={short['first_content']:.2f}s, {short['events']} content deltas")
 
-    # One continuous RunSSE must stay open past the wall gate. RunSSE must not
-    # pass host timeout_ms (hard download deadline); longevity is stream-idle.
-    long_seconds = float(os.environ.get("HALO_CURSOR_AUTO_LONG_SECONDS", "40"))
-    if not 0 < long_seconds < float("inf"):
-        fail("HALO_CURSOR_AUTO_LONG_SECONDS must be finite and positive")
-    long_started_at = int(time.time() * 1000)
-    long_started = time.monotonic()
-    # ~1000字通常墙钟 >40s，又不易把 16 次传输续写打满。
-    outcome = chat(
-        "用中文写一篇大约1000字的文章，主题是流式 API 的可靠性："
-        "覆盖请求验证、首包、分帧、心跳、结束事件与超时，分小节展开，"
-        "不要提纲；写满约一千字后自然收束。",
-        timeout=max(360, int(long_seconds) + 300),
+# Measure the active output span of one client SSE response.
+long_seconds = float(os.environ.get("HALO_CURSOR_AUTO_LONG_SECONDS", "40"))
+if not 0 < long_seconds < float("inf"):
+    fail("HALO_CURSOR_AUTO_LONG_SECONDS must be finite and positive")
+long_started_at = int(time.time() * 1000)
+# ~1000字通常墙钟 >40s，又不易把 16 次传输续写打满。
+outcome = chat(
+    "用中文写一篇大约1000字的文章，主题是流式 API 的可靠性："
+    "覆盖请求验证、首包、分帧、心跳、结束事件与超时，分小节展开，"
+    "不要提纲；写满约一千字后自然收束。",
+    timeout=max(360, int(long_seconds) + 300),
+)
+expect_halo_route(long_started_at)
+elapsed = outcome["content_span"]
+if elapsed < long_seconds or outcome["events"] < 2:
+    fail(
+        f"{CHAT_MODEL} long chat only reached {elapsed:.1f}s in one stream "
+        f"(need >={long_seconds:.0f}s, events={outcome['events']})"
     )
-    expect_halo_route(long_started_at)
-    elapsed = outcome.get("elapsed") or (time.monotonic() - long_started)
-    if elapsed < long_seconds or outcome["events"] < 2:
-        fail(
-            f"auto long chat only reached {elapsed:.1f}s in one stream "
-            f"(need >={long_seconds:.0f}s, events={outcome['events']})"
-        )
-    ok(
-        f"auto long chat: {elapsed:.1f}s one stream, "
-        f"{outcome['events']} content deltas, {outcome['chars']} chars"
-    )
-finally:
-    for item_id in paused:
-        status, _ = call(
-            "PATCH",
-            f"/api/accounts/{item_id}",
-            {"enabled": True},
-            timeout=30,
-        )
-        if status != 200:
-            print(f"WARN: failed to restore account {item_id} (HTTP {status})", file=sys.stderr)
+ok(
+    f"{CHAT_MODEL} long chat: {elapsed:.1f}s one stream, "
+    f"{outcome['events']} content deltas, {outcome['chars']} chars"
+)
 
 print("SMOKE PASS")
 PY

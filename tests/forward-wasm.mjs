@@ -122,9 +122,15 @@ function hostRun(scenario) {
             break
           }
           if (initial && config.kvLookup) {
-            const offset = message.indexOf(Buffer.from([0x42, 0x20]))
+            const tag = config.kvLookup === "history" ? 0x0a : 0x42
+            let state = message
+            for (let i = 0; i < 2; i++) {
+              const [start, length] = requestLength(state)
+              state = state.subarray(start, start + length)
+            }
+            const offset = state.indexOf(Buffer.from([tag, 0x20]))
             assert.notEqual(offset, -1)
-            const hash = message.subarray(offset + 2, offset + 34)
+            const hash = state.subarray(offset + 2, offset + 34)
             config.chunks.unshift(frame(field(4, concat(field(1, 1), field(2, field(1, hash))))))
           }
           streams.set(id, initial && config.appendError ? [JSON.stringify(config.appendError)] : [])
@@ -241,12 +247,14 @@ test("explicit Max Mode refusals after output do not replay", () => {
 
 test("transport peer-closed mid-stream continues on a new RunSSE", () => {
   const run = hostRun({
+    body: {model: "auto", messages: [{role: "user", content: "fixture"}]},
     attempts: [
       {
         chunks: [content("hello ")],
         readError: {message: "error decoding response body → peer closed connection without sending TLS close_notify", status: 502},
+        kvLookup: "history",
       },
-      {chunks: [content("world"), end()]},
+      {chunks: [content("world"), end()], kvLookup: "history"},
     ],
   })
   assert.equal(run.attempts, 2)
@@ -254,6 +262,10 @@ test("transport peer-closed mid-stream continues on a new RunSSE", () => {
   const texts = run.frames.map((item) => item.choices[0].delta.content).filter(Boolean)
   assert.deepEqual(texts, ["hello ", "world"])
   assert.equal(run.frames.at(-1).choices[0].finish_reason, "stop")
+  const [first, resumed] = [0, 1].map((attempt) =>
+    run.appended.filter((entry) => entry.attempt === attempt)[1].message)
+  assert.ok(first.includes(Buffer.from("fixture")))
+  assert.deepEqual(resumed, first)
 })
 
 test("parallel tool calls across reads are forwarded before closing the batch", () => {

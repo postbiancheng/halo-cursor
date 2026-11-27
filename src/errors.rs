@@ -201,6 +201,9 @@ pub fn classify(status: u16, body: &Value) -> Value {
     if code == "cursor_append_unconfirmed" || raw.contains("Cursor BidiAppend 确认失败") {
         return json!({"kind":"append_unconfirmed","status":failed,"message":raw});
     }
+    if code == "plugin_resource_limit" || lower.contains("wasm 插件计算额度耗尽") {
+        return json!({"kind":"plugin_resource_limit","status":failed,"message":raw});
+    }
 
     if status == 401
         || matches!(
@@ -304,7 +307,7 @@ pub fn policy(status: u16, body: &Value) -> Value {
         "cursor_partial_stream" | "cursor_append_unconfirmed"
     );
     json!({
-        "stop": stopped || matches!(kind, "token_expired" | "content_blocked" | "request_invalid" | "client_version" | "partial_stream" | "append_unconfirmed"),
+        "stop": stopped || matches!(kind, "token_expired" | "content_blocked" | "request_invalid" | "client_version" | "partial_stream" | "append_unconfirmed" | "plugin_resource_limit"),
         "kind": kind,
     })
 }
@@ -337,6 +340,7 @@ pub fn retry(params: &Value) -> Value {
             | "cursor_append_unconfirmed"
             | "cursor_max_mode_required"
             | "cursor_client_version"
+            | "plugin_resource_limit"
     ) || matches!(
         kind,
         "token_expired"
@@ -346,6 +350,7 @@ pub fn retry(params: &Value) -> Value {
             | "client_version"
             | "partial_stream"
             | "append_unconfirmed"
+            | "plugin_resource_limit"
     ) {
         return json!({ "action": "stop", "reason": "当前请求不可直接重试" });
     }
@@ -468,5 +473,23 @@ mod tests {
             let decision = retry(&json!({"status":502,"body":{"error":{"code":code}}}));
             assert_eq!(decision["action"], "stop");
         }
+    }
+
+    #[test]
+    fn host_resource_limit_has_its_own_class_and_stops_retry() {
+        for body in [
+            json!({"error":{"code":"plugin_resource_limit","message":"Wasm resource limit"}}),
+            json!("Wasm 插件计算额度耗尽（处理窗口）"),
+        ] {
+            let class = classify(502, &body);
+            assert_eq!(class["kind"], "plugin_resource_limit");
+            assert_eq!(class["status"], 502);
+            assert_eq!(policy(502, &body)["stop"], true);
+            assert_eq!(retry(&json!({"status":502,"body":body}))["action"], "stop");
+        }
+        assert_eq!(
+            retry(&json!({"status":502,"code":"plugin_resource_limit"}))["action"],
+            "stop"
+        );
     }
 }

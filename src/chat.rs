@@ -288,66 +288,94 @@ fn put_blob(blobs: &mut BlobMap, bytes: Vec<u8>) -> [u8; 32] {
     id
 }
 
-fn build_run(
-    msgs: &[Vec<u8>],
-    last_user: &str,
-    tools: &[ToolDef],
-    model: &str,
-    conv: &str,
-    max_mode: bool,
-    params: &[(String, String)],
-) -> Result<(Vec<u8>, BlobMap)> {
-    let mut blobs = BTreeMap::new();
-    let mut state = Pb::new();
-    for m in msgs {
-        let id = put_blob(&mut blobs, m.clone());
-        state = state.bytes(1, &id);
-    }
-    let mid = client::uuid_v4()?;
-    let user = Pb::new().str(1, last_user).str(2, &mid).varint(4, 1).done();
-    let user_id = put_blob(&mut blobs, user);
-    let turn_inner = Pb::new().bytes(1, &user_id).str(10, &mid).done();
-    let turn = Pb::new().bytes(1, &turn_inner).done();
-    let turn_id = put_blob(&mut blobs, turn);
-    state = state.bytes(8, &turn_id).varint(10, 1).str(22, "cli");
+struct RunContext {
+    messages: Vec<[u8; 32]>,
+    blobs: BlobMap,
+    turn_blobs: BlobMap,
+    action: Vec<u8>,
+    mcp: Vec<u8>,
+}
 
-    let defs: Vec<Vec<u8>> = tools.iter().map(tool_def_bytes).collect();
-    let mut rc = Pb::new().bytes(4, &env_bytes());
-    let mut mcp = Pb::new();
-    for d in &defs {
-        rc = rc.bytes(7, d);
-        mcp = mcp.bytes(1, d);
-    }
-    let action = Pb::new().nested(2, Pb::new().nested(2, rc));
+impl RunContext {
+    fn new(messages: Vec<Vec<u8>>, tools: &[ToolDef]) -> Self {
+        let mut blobs = BlobMap::new();
+        let messages = messages
+            .into_iter()
+            .map(|message| put_blob(&mut blobs, message))
+            .collect();
 
-    let mut details = Pb::new().str(1, model).str(3, model).str(4, model);
-    let mut requested = Pb::new().str(1, model);
-    if max_mode {
-        details = details.varint(7, 1);
-        requested = requested.varint(2, 1);
-    }
-    for (id, value) in params {
-        requested = requested.nested(3, Pb::new().str(1, id).str(2, value));
+        let mut rc = Pb::new().bytes(4, &env_bytes());
+        let mut mcp = Pb::new();
+        for tool in tools {
+            let definition = tool_def_bytes(tool);
+            rc = rc.bytes(7, &definition);
+            mcp = mcp.bytes(1, &definition);
+        }
+        Self {
+            messages,
+            blobs,
+            turn_blobs: BlobMap::new(),
+            action: Pb::new().nested(2, Pb::new().nested(2, rc)).done(),
+            mcp: mcp.done(),
+        }
     }
 
-    let cid = if conv.is_empty() {
-        client::uuid_v4()?
-    } else {
-        conv.to_string()
-    };
+    fn push_message(&mut self, message: Value) -> Result<()> {
+        let bytes =
+            serde_json::to_vec(&message).map_err(|_| Error::http(500, "续写上下文编码失败"))?;
+        self.messages.push(put_blob(&mut self.blobs, bytes));
+        Ok(())
+    }
 
-    let rr = Pb::new()
-        .nested(1, state)
-        .nested(2, action)
-        .nested(3, details)
-        .nested(4, mcp)
-        .str(5, &cid)
-        .nested(9, requested)
-        .varint(19, 1)
-        .varint(37, 1);
+    fn build_run(
+        &mut self,
+        last_user: &str,
+        model: &str,
+        conv: &str,
+        max_mode: bool,
+        params: &[(String, String)],
+    ) -> Result<Vec<u8>> {
+        self.turn_blobs.clear();
+        let mut state = Pb::new();
+        for id in &self.messages {
+            state = state.bytes(1, id);
+        }
+        let mid = client::uuid_v4()?;
+        let user = Pb::new().str(1, last_user).str(2, &mid).varint(4, 1).done();
+        let user_id = put_blob(&mut self.turn_blobs, user);
+        let turn_inner = Pb::new().bytes(1, &user_id).str(10, &mid).done();
+        let turn = Pb::new().bytes(1, &turn_inner).done();
+        let turn_id = put_blob(&mut self.turn_blobs, turn);
+        state = state.bytes(8, &turn_id).varint(10, 1).str(22, "cli");
 
-    let first = Pb::new().nested(1, rr).done();
-    Ok((first, blobs))
+        let mut details = Pb::new().str(1, model).str(3, model).str(4, model);
+        let mut requested = Pb::new().str(1, model);
+        if max_mode {
+            details = details.varint(7, 1);
+            requested = requested.varint(2, 1);
+        }
+        for (id, value) in params {
+            requested = requested.nested(3, Pb::new().str(1, id).str(2, value));
+        }
+
+        let cid = if conv.is_empty() {
+            client::uuid_v4()?
+        } else {
+            conv.to_string()
+        };
+
+        let rr = Pb::new()
+            .nested(1, state)
+            .bytes(2, &self.action)
+            .nested(3, details)
+            .bytes(4, &self.mcp)
+            .str(5, &cid)
+            .nested(9, requested)
+            .varint(19, 1)
+            .varint(37, 1);
+
+        Ok(Pb::new().nested(1, rr).done())
+    }
 }
 
 fn conversation_id(body: &Value) -> String {
@@ -406,8 +434,10 @@ fn model_params(body: &Value) -> (bool, Vec<(String, String)>) {
 }
 
 pub(crate) fn bidi_append(headers: &Value, request_id: &str, msg: &[u8], seq: u64) -> Result<()> {
+    let mut encoded = vec![0; msg.len() * 2];
+    hex::encode_to_slice(msg, &mut encoded).expect("hex output is twice the input length");
     let body = Pb::new()
-        .str(1, &hex::encode(msg))
+        .bytes(1, &encoded)
         .nested(2, Pb::new().str(1, request_id))
         .varint(3, seq)
         .done();
@@ -532,24 +562,6 @@ fn is_resumable_transport_cut(error: &Error) -> bool {
     .any(|part| message.contains(part))
 }
 
-fn push_continue_turn(messages: &mut Vec<Vec<u8>>, partial: &str) -> Result<()> {
-    messages.push(
-        serde_json::to_vec(&json!({
-            "role": "assistant",
-            "content": [{"type": "text", "text": partial}]
-        }))
-        .map_err(|_| Error::http(500, "续写上下文编码失败"))?,
-    );
-    messages.push(
-        serde_json::to_vec(&json!({
-            "role": "user",
-            "content": [{"type": "text", "text": CONTINUE_USER}]
-        }))
-        .map_err(|_| Error::http(500, "续写上下文编码失败"))?,
-    );
-    Ok(())
-}
-
 enum AttemptEnd {
     Done,
     Continue,
@@ -564,7 +576,7 @@ pub fn forward(body: Value) -> Result<()> {
     } else {
         tools_of(&body)
     };
-    let (mut messages, mut last) = conversation_blobs(&body, &tools)?;
+    let (messages, mut last) = conversation_blobs(&body, &tools)?;
     let model_raw = body["model"].as_str().unwrap_or("claude-sonnet-4-6");
     let conv = conversation_id(&body);
     sdk::stream_head(200)?;
@@ -586,14 +598,15 @@ pub fn forward(body: Value) -> Result<()> {
         text: String::new(),
         tools_started: false,
     };
+    let mut context = RunContext::new(messages, &tools);
     let mut continues = 0_u32;
     let mut continued_from = 0usize;
 
     loop {
         let request_id = client::uuid_v4()?;
         headers["x-request-id"] = json!(&request_id);
-        let (first, blobs) = build_run(&messages, &last, &tools, &model, &conv, max_mode, &params)?;
-        let result = run_attempt(&mut out, &headers, &request_id, &first, &blobs, &tools);
+        let first = context.build_run(&last, &model, &conv, max_mode, &params)?;
+        let result = run_attempt(&mut out, &headers, &request_id, &first, &context, &tools);
         match result {
             Err(error)
                 if !max_mode
@@ -606,18 +619,17 @@ pub fn forward(body: Value) -> Result<()> {
                 if out.started && !out.tools_started && continues < MAX_STREAM_CONTINUES =>
             {
                 // Visible text is preferred, but reasoning-only cuts still resume.
-                let partial = out.text[continued_from..].to_string();
+                let partial = &out.text[continued_from..];
                 if !partial.is_empty() {
-                    push_continue_turn(&mut messages, &partial)?;
-                } else {
-                    messages.push(
-                        serde_json::to_vec(&json!({
-                            "role": "user",
-                            "content": [{"type": "text", "text": CONTINUE_USER}]
-                        }))
-                        .map_err(|_| Error::http(500, "续写上下文编码失败"))?,
-                    );
+                    context.push_message(json!({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": partial}]
+                    }))?;
                 }
+                context.push_message(json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": CONTINUE_USER}]
+                }))?;
                 last = CONTINUE_USER.to_string();
                 continued_from = out.text.len();
                 continues += 1;
@@ -728,7 +740,7 @@ fn run_attempt(
     headers: &Value,
     request_id: &str,
     first: &[u8],
-    blobs: &BlobMap,
+    context: &RunContext,
     tools: &[ToolDef],
 ) -> Result<AttemptEnd> {
     let open_body = proto::frame(&Pb::new().str(1, request_id).done());
@@ -931,7 +943,7 @@ fn run_attempt(
                             .count();
                         checkpoint_ready = pending == batch.emitted.len();
                     }
-                    4 => handle_kv(&message.data, blobs, &mut seq, headers, request_id)?,
+                    4 => handle_kv(&message.data, context, &mut seq, headers, request_id)?,
                     _ => {}
                 }
                 // A batch answered inside the plugin clears its count before the next step.
@@ -951,7 +963,7 @@ fn run_attempt(
 
 fn handle_kv(
     data: &[u8],
-    blobs: &BlobMap,
+    context: &RunContext,
     seq: &mut u64,
     headers: &Value,
     request_id: &str,
@@ -964,7 +976,11 @@ fn handle_kv(
             let want = proto::field(&fields, 1)
                 .map(|field| hex::encode(&field.data))
                 .unwrap_or_default();
-            let res = if let Some(b) = blobs.get(&want) {
+            let blob = context
+                .turn_blobs
+                .get(&want)
+                .or_else(|| context.blobs.get(&want));
+            let res = if let Some(b) = blob {
                 Pb::new().bytes(1, b).done()
             } else {
                 Pb::new()

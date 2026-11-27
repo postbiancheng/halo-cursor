@@ -1,6 +1,6 @@
 [package]
 name = "agent2api-halo-cursor"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 license = "AGPL-3.0-only"
 

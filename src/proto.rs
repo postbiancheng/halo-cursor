@@ -2,7 +2,7 @@
 
 #[derive(Default)]
 pub struct Pb {
-    parts: Vec<Vec<u8>>,
+    bytes: Vec<u8>,
 }
 
 impl Pb {
@@ -11,18 +11,16 @@ impl Pb {
     }
 
     fn push_bytes(mut self, bytes: &[u8]) -> Self {
-        self.parts.push(bytes.to_vec());
+        self.bytes.extend_from_slice(bytes);
         self
     }
 
     fn uv(mut self, mut value: u64) -> Self {
-        let mut out = Vec::new();
         while value >= 0x80 {
-            out.push(((value as u8) & 0x7f) | 0x80);
+            self.bytes.push(((value as u8) & 0x7f) | 0x80);
             value >>= 7;
         }
-        out.push(value as u8);
-        self.parts.push(out);
+        self.bytes.push(value as u8);
         self
     }
 
@@ -52,7 +50,7 @@ impl Pb {
     }
 
     pub fn done(self) -> Vec<u8> {
-        self.parts.into_iter().flatten().collect()
+        self.bytes
     }
 }
 
