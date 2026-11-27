@@ -2,6 +2,7 @@
 
 use super::{auth, client, PROVIDER};
 use agent2api_wasm_sdk::{json, Error, Result, Value};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub fn query() -> Result<Value> {
     let secret = auth::credentials(false)?;
@@ -579,6 +580,11 @@ struct SandWindow {
     resets_at: Option<i64>,
 }
 
+fn parse_timestamp(value: &Value) -> Option<i64> {
+    let date = OffsetDateTime::parse(value.as_str()?, &Rfc3339).ok()?;
+    i64::try_from(date.unix_timestamp_nanos().div_euclid(1_000_000)).ok()
+}
+
 fn sand_window(sand: Option<&Value>, now: i64) -> Option<SandWindow> {
     let data = sand?;
     let paid = boolish(data.get("includedLimitZero"))
@@ -588,18 +594,14 @@ fn sand_window(sand: Option<&Value>, now: i64) -> Option<SandWindow> {
     let trial = !paid
         && data
             .get("sandTrialExpiresAt")
-            .and_then(Value::as_str)
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .is_some_and(|t| t.timestamp_millis() > now);
+            .and_then(parse_timestamp)
+            .is_some_and(|expires_at| expires_at > now);
     let usage = number(data.get("usagePercent"))?;
     if (!paid && !trial) || !usage.is_finite() {
         return None;
     }
     let resets_at = if paid {
-        data.get("nextResetTimestampUtc")
-            .and_then(Value::as_str)
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|t| t.timestamp_millis())
+        data.get("nextResetTimestampUtc").and_then(parse_timestamp)
     } else {
         None
     };
@@ -617,6 +619,15 @@ fn sand_window(sand: Option<&Value>, now: i64) -> Option<SandWindow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_timestamps_preserve_offsets_and_milliseconds() {
+        assert_eq!(
+            parse_timestamp(&json!("2026-11-26T08:00:00.125+08:00")),
+            Some(1_795_651_200_125)
+        );
+        assert_eq!(parse_timestamp(&json!("invalid")), None);
+    }
 
     #[test]
     fn parses_included_pools_without_total() {

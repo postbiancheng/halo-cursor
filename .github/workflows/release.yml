@@ -1,0 +1,67 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  check:
+    uses: ./.github/workflows/check.yml
+  release:
+    needs: check
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" != "v$VERSION" ]]; then
+            echo "tag $TAG does not match Cargo.toml version v$VERSION" >&2
+            exit 1
+          fi
+          ZIP="agent2api-wasm-halo-cursor-${VERSION}.zip"
+          if release="$(gh release view "$TAG" --json isDraft,assets 2>&1)"; then
+            if ! jq -e --arg zip "$ZIP" --arg sum "$ZIP.sha256" '
+              (.isDraft == false) and
+              any(.assets[]; .name == $zip and .size > 0) and
+              any(.assets[]; .name == $sum and .size > 0) and
+              any(.assets[]; .name == ($zip + ".build-info") and .size > 0)
+            ' <<< "$release" > /dev/null; then
+              echo "Existing release $TAG is a draft or is missing an expected asset" >&2
+              exit 1
+            fi
+            echo "Release $TAG already contains the ZIP, checksum and build record. Skipping publication."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$release" == "release not found" ]]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            printf '%s\n' "$release" >&2
+            exit 1
+          fi
+      - name: Pack
+        if: steps.release.outputs.exists == 'false'
+        run: ./scripts/pack.sh
+      - name: Publish GitHub Release
+        if: steps.release.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          ZIP="dist/agent2api-wasm-halo-cursor-${VERSION}.zip"
+          SUM="dist/agent2api-wasm-halo-cursor-${VERSION}.zip.sha256"
+          gh release create "$TAG" "$ZIP" "$SUM" "$ZIP.build-info" --verify-tag \
+            --title "Halo Cursor ${VERSION}" \
+            --notes "Agent2API WASM pack \`agent2api-wasm-halo-cursor\` ${VERSION}."

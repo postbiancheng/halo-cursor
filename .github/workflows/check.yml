@@ -2,7 +2,9 @@ name: Check
 
 on:
   push:
+    branches: ["**"]
   pull_request:
+  workflow_call:
 
 jobs:
   test:
@@ -12,12 +14,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: rustup target add wasm32-unknown-unknown
-      - run: rustup component add clippy rustfmt
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
-      - run: cargo build --locked --release --target wasm32-unknown-unknown
+      - run: cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo test --locked --all-targets
+      - run: ./scripts/pack.sh
       - run: node --test tests/forward-wasm.mjs
       - name: Check package metadata and scripts
         run: |
@@ -32,3 +35,10 @@ jobs:
           NODE
           bash -n scripts/pack.sh
           bash -n scripts/smoke-local.sh
+          cd dist
+          sha256sum --check agent2api-wasm-halo-cursor-*.zip.sha256
+          unzip -tq agent2api-wasm-halo-cursor-*.zip
+          entries="$(unzip -Z1 agent2api-wasm-halo-cursor-*.zip)"
+          for entry in pack.json wasm.json halo-cursor.wasm assets/logo.svg; do
+            grep -Fxq "$entry" <<< "$entries"
+          done

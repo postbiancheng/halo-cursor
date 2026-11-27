@@ -11,26 +11,20 @@ WASM_SRC="target/wasm32-unknown-unknown/release/agent2api_halo_cursor.wasm"
 WASM_DST="${OUT_DIR}/halo-cursor.wasm"
 ZIP="${OUT_DIR}/${NAME}-${VERSION}.zip"
 
-# Prefer the rustup toolchain binaries. Homebrew rust on PATH often lacks wasm32 std.
-if command -v rustup >/dev/null 2>&1; then
-  rustup target add wasm32-unknown-unknown >/dev/null
-  export RUSTC
-  export CARGO
-  RUSTC="$(rustup which rustc)"
-  CARGO="$(rustup which cargo)"
-  TOOLCHAIN="$(rustup show active-toolchain 2>/dev/null | awk '{print $1}')"
-  if [[ -n "${TOOLCHAIN}" && -x "${HOME}/.rustup/toolchains/${TOOLCHAIN}/bin/cargo" ]]; then
-    RUSTC="${HOME}/.rustup/toolchains/${TOOLCHAIN}/bin/rustc"
-    CARGO="${HOME}/.rustup/toolchains/${TOOLCHAIN}/bin/cargo"
-  fi
-elif [[ -x "${HOME}/.cargo/bin/cargo" ]]; then
-  CARGO="${HOME}/.cargo/bin/cargo"
-  RUSTC="${HOME}/.cargo/bin/rustc"
-else
-  CARGO="cargo"
+# Resolve Cargo and rustc together from the toolchain declared in rust-toolchain.toml.
+RUSTUP_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
+if [[ -x "$RUSTUP_BIN_DIR/rustup" ]]; then
+  export PATH="$RUSTUP_BIN_DIR:$PATH"
+fi
+if ! command -v rustup >/dev/null 2>&1; then
+  echo "rustup is required to build the toolchain declared in rust-toolchain.toml." >&2
+  exit 1
 fi
 
-"$CARGO" build --locked --release --target wasm32-unknown-unknown
+rustup toolchain install --no-update --no-self-update
+CARGO_BIN="$(rustup which cargo)"
+RUSTC="$(rustup which rustc)" "$CARGO_BIN" build --locked --release \
+  --target wasm32-unknown-unknown --target-dir "$ROOT/target"
 
 mkdir -p "$OUT_DIR"
 cp -f "$WASM_SRC" "$WASM_DST"

@@ -1,6 +1,7 @@
 //! Cursor upstream error classification for the Agent2API host.
 
 use agent2api_wasm_sdk::{self as sdk, http, json, Error, Result, Value};
+use time::{format_description::well_known::Rfc2822, OffsetDateTime};
 
 fn detail_from_connect(body: &Value) -> Option<String> {
     // Magpie: Connect errors often put the useful text under details[].debug.details.
@@ -103,9 +104,9 @@ fn retry_after(header: &str) -> Option<i64> {
         .filter(|seconds| *seconds >= 0)
         .map(|seconds| now.saturating_add(seconds.saturating_mul(1_000)))
         .or_else(|| {
-            chrono::DateTime::parse_from_rfc2822(header)
+            OffsetDateTime::parse(header, &Rfc2822)
                 .ok()
-                .map(|date| date.timestamp_millis())
+                .and_then(|date| date.unix_timestamp().checked_mul(1_000))
         })
         .filter(|time| *time >= now)
 }
@@ -403,6 +404,16 @@ pub fn advice(params: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_after_accepts_seconds_and_gmt_http_dates() {
+        assert_eq!(retry_after("2"), Some(sdk::now() + 2_000));
+        assert_eq!(
+            retry_after("Thu, 26 Nov 2026 00:00:00 GMT"),
+            Some(1_795_651_200_000)
+        );
+        assert_eq!(retry_after("invalid"), None);
+    }
 
     #[test]
     fn classifies_auth_quota_and_content() {

@@ -30,7 +30,10 @@ Agent2API WASM 插件仓库：https://github.com/postbiancheng/halo-cursor
 
 ## 构建
 
+本地、CI 和打包统一使用 rustup，Rust 版本、工具和 WASM target 由 `rust-toolchain.toml` 固定。macOS 同时装有 Homebrew Rust 时，将 `~/.cargo/bin` 放在 Homebrew 的 bin 之前。
+
 ```bash
+rustup toolchain install --no-self-update
 ./scripts/pack.sh
 ```
 
@@ -50,14 +53,14 @@ Agent2API WASM 插件仓库：https://github.com/postbiancheng/halo-cursor
 
 ## 安装
 
-在 Agent2API 中安装上述 zip，或对本机已运行的实例：
+在 Agent2API 插件页面安装本地 ZIP 或 [GitHub Releases](https://github.com/postbiancheng/halo-cursor/releases) 的安装包。也可通过本机 API 安装。
 
 ```bash
 # 示例：通过本地 API 安装（需 AGENT2API_API_KEY）
 python3 - <<'PY'
 import base64, json, urllib.request, os
 key = os.environ["AGENT2API_API_KEY"]
-zip_path = "dist/agent2api-wasm-halo-cursor-0.1.11.zip"
+zip_path = "dist/agent2api-wasm-halo-cursor-0.1.12.zip"
 body = json.dumps({"packB64": base64.b64encode(open(zip_path, "rb").read()).decode()}).encode()
 req = urllib.request.Request(
     "http://127.0.0.1:3065/api/plugins/install",
@@ -69,8 +72,18 @@ print(urllib.request.urlopen(req, timeout=60).read()[:200])
 PY
 ```
 
+## 发布
+
+对齐 `Cargo.toml`、`Cargo.lock` 和 `pack.json` 的版本。候选包通过真实短对话和至少 40 秒的长流冒烟后，再提交、推送并打标签。发行工作流会先检查标签对应的提交，再上传 ZIP、`.sha256` 和 `.build-info`。
+
+```bash
+git tag v0.1.12
+git push origin v0.1.12
+```
+
 ## 版本摘要
 
+- **0.1.12**：统一 Rust 1.100.0 和锁定构建，改用 `time` 解析用量与限流时间，CI 增加 WASM、安装包校验及标签触发的发布。
 - **0.1.11**：修复流式响应状态、工具批次收尾、BidiAppend 退避、EOF 续写及用量合并；修复登录轮询卡住、空模型目录覆盖缓存及上下文变体选择。
 - **0.1.10**：断线续写复用历史消息哈希和工具定义，区分宿主计算额度与账号用量；冒烟测试走独立路由，移除账号开关操作。
 - **0.1.9**：长思考空读采用指数退避并限制为每秒一次，收到上游数据后恢复短间隔，避免长流耗尽 WASM fuel。
