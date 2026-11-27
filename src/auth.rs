@@ -11,6 +11,8 @@ const KEY: &str = "cursor-deep-control";
 const TTL: i64 = 900_000;
 const LEAD: i64 = 300_000;
 const POLL_INTERVAL: i64 = 2_000;
+const POLL_TIMEOUT_MS: u64 = 15_000;
+const POLL_LEASE_MS: i64 = POLL_TIMEOUT_MS as i64 + 5_000;
 
 fn put(snapshot: &state::Snapshot, value: Value, ttl: i64) -> Result<()> {
     if state::compare_exchange(Scope::Login, KEY, 1, snapshot.revision, value, ttl)? {
@@ -134,7 +136,6 @@ pub fn start(params: &Value) -> Result<Value> {
             "interval": POLL_INTERVAL,
             "nextAt": now + POLL_INTERVAL,
             "expiresAt": now + TTL,
-            "busy": false,
             "errors": 0,
         }),
         TTL,
@@ -172,11 +173,18 @@ pub fn poll() -> Result<Value> {
     if before.value.is_null() || deadline <= now {
         return Ok(json!({"state":"failed","message":"Cursor 登录已超时，请重试"}));
     }
-    if before.value["busy"] == true || before.value["nextAt"].as_i64().unwrap_or(0) > now {
+    if before.value["busyUntil"].as_i64().unwrap_or(0) > now
+        || before.value["nextAt"].as_i64().unwrap_or(0) > now
+    {
         return Ok(login::pending(None));
     }
+    let version = super::config::client_version()?;
+    let now = sdk::now();
+    if deadline <= now {
+        return Ok(json!({"state":"failed","message":"Cursor 登录已超时，请重试"}));
+    }
     let mut flow = before.value.clone();
-    flow["busy"] = json!(true);
+    flow["busyUntil"] = json!(now.saturating_add(POLL_LEASE_MS).min(deadline));
     put(&before, flow.clone(), deadline - now)?;
     let reserved = state::get(Scope::Login, KEY, 1)?;
     if reserved.value != flow {
@@ -185,7 +193,6 @@ pub fn poll() -> Result<Value> {
 
     let uuid = flow["uuid"].as_str().unwrap_or_default();
     let verifier = flow["verifier"].as_str().unwrap_or_default();
-    let version = super::config::client_version()?;
     let url = format!(
         "{}/auth/poll?uuid={}&verifier={}",
         client::API,
@@ -202,7 +209,7 @@ pub fn poll() -> Result<Value> {
             "Accept": "application/json",
         }),
         None,
-        15_000,
+        POLL_TIMEOUT_MS,
     );
 
     let (status, body) = match response {
@@ -228,7 +235,7 @@ pub fn poll() -> Result<Value> {
             put(&reserved, Value::Null, 1000)?;
             return Ok(json!({"state":"failed","message":"无法连接 Cursor 授权服务"}));
         }
-        flow["busy"] = json!(false);
+        flow["busyUntil"] = json!(0);
         flow["errors"] = json!(errors);
         flow["nextAt"] = json!(sdk::now() + POLL_INTERVAL);
         put(&reserved, flow, (deadline - sdk::now()).max(1000))?;
@@ -248,7 +255,7 @@ pub fn poll() -> Result<Value> {
                 json!({"state":"failed","message":format!("Cursor 授权失败：HTTP {status}")}),
             );
         }
-        flow["busy"] = json!(false);
+        flow["busyUntil"] = json!(0);
         flow["errors"] = json!(errors);
         flow["nextAt"] = json!(sdk::now() + POLL_INTERVAL);
         put(&reserved, flow, (deadline - sdk::now()).max(1000))?;

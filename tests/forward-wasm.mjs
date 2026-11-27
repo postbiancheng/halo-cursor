@@ -57,7 +57,8 @@ function hostRun(scenario) {
   let attempt = -1
   let tick = 0
   const streams = new Map()
-  const scenarioAttempts = scenario.attempts.map((config) => ({...config, chunks: [...config.chunks]}))
+  const scenarioAttempts = (scenario.attempts ?? []).map((config) => ({...config, chunks: [...config.chunks]}))
+  let snapshot = scenario.snapshot ?? {revision: 0, schema: 1, compatible: true, value: null}
   const events = []
   const calls = []
   const sleeps = []
@@ -72,6 +73,7 @@ function hostRun(scenario) {
     switch (method) {
       case "account.get":
         result = {secret: {accessToken: "test-token", expiresAt: 2_000_000_000_000, identity: "cursor:test"}}
+        if (scenario.accountError) error = scenario.accountError
         break
       case "clock.now":
         result = 1_700_000_000_000 + tick
@@ -81,12 +83,23 @@ function hostRun(scenario) {
         tick += params.milliseconds
         break
       case "state.get":
-        result = {revision: 0, schema: 1, compatible: true, value: null}
+        result = snapshot
         break
+      case "state.compare_exchange":
+        assert.equal(params.revision, snapshot.revision)
+        snapshot = {...snapshot, value: params.value, revision: snapshot.revision + 1}
+        result = {updated: true}
+        break
+      case "lock.acquire":
+        result = "test-lock"
+        break
+      case "lock.release":
       case "catalog.get":
       case "stream.head":
-      case "settings.get":
       case "http.close":
+        break
+      case "settings.get":
+        error = scenario.settingsError
         break
       case "random.bytes":
         result = base64(Buffer.alloc(params.length, ++random))
@@ -99,7 +112,12 @@ function hostRun(scenario) {
         events.push(Buffer.from(params.data, "base64").toString())
         break
       case "http.open": {
-        if (params.url.endsWith("/RunSSE")) {
+        const path = new URL(params.url).pathname
+        const configured = scenario.httpResponses?.[path]
+        if (configured) {
+          streams.set(path, configured.chunks ?? [])
+          result = {status: configured.status ?? 200, id: path, headers: {}}
+        } else if (path.endsWith("/RunSSE")) {
           assert.equal(params.headers["connect-timeout-ms"], undefined)
           assert.equal(params.timeout_ms, undefined)
           const config = scenarioAttempts[++attempt]
@@ -133,7 +151,12 @@ function hostRun(scenario) {
             const hash = state.subarray(offset + 2, offset + 34)
             config.chunks.unshift(frame(field(4, concat(field(1, 1), field(2, field(1, hash))))))
           }
-          streams.set(id, initial && config.appendError ? [JSON.stringify(config.appendError)] : [])
+          if (initial) {
+            const chunks = config.appendError ? [JSON.stringify(config.appendError)] : config.appendChunks
+            streams.set(id, [...(chunks ?? [])])
+          } else {
+            streams.set(id, [])
+          }
           result = {status: initial && config.appendError ? 400 : 200, id, headers: {}}
         }
         break
@@ -168,14 +191,17 @@ function hostRun(scenario) {
     model: "auto", messages: [{role: "user", content: "fixture"}],
     tools: [{type: "function", function: {name: "lookup"}}],
   }
-  const data = Buffer.from(JSON.stringify({method: "conversation", params: {body}}))
+  const data = Buffer.from(JSON.stringify({
+    method: scenario.method ?? "conversation",
+    params: scenario.params ?? {body},
+  }))
   const pointer = instance.exports.a2a_alloc(data.length)
   data.copy(memory(), pointer)
   const packed = instance.exports.a2a_call(pointer, data.length)
   const start = Number(packed & 0xffffffffn)
   const output = JSON.parse(memory().subarray(start, start + Number(packed >> 32n)).toString())
   return {
-    output, calls, sleeps, appended, elapsed: tick, attempts: attempt + 1,
+    output, calls, sleeps, appended, snapshot, elapsed: tick, attempts: attempt + 1,
     done: events.some((line) => line === "data: [DONE]\n\n"),
     frames: events.filter((line) => !line.includes("[DONE]")).map((line) => JSON.parse(line.slice(6))),
   }
@@ -206,12 +232,14 @@ test("normal completion preserves trailing usage and supports arbitrary framing"
   assert.equal(run.frames.at(-1).choices[0].finish_reason, "stop")
   assert.equal(run.frames.at(-1).usage.total_tokens, 6)
   assert.equal(run.frames[1].choices[0].delta.content, "hello")
-  assert.ok(run.calls.indexOf("stream.head") < run.calls.indexOf("account.get"))
+  assert.equal(run.calls.filter((call) => call === "stream.head").length, 1)
+  assert.equal(run.calls.indexOf("stream.head") + 1, run.calls.indexOf("stream.chunk"))
+  assert.ok(run.calls.indexOf("stream.head") > run.calls.indexOf("http.read"))
 })
 
 for (const [label, tail] of [
   ["after upstream error", [failedEnd]],
-  ["after EOF", []],
+  ["after turn usage followed by EOF", [usage]],
   ["after a truncated envelope", [failedEnd.subarray(0, 8)]],
   ["after usage followed by a later upstream error", [usage, failedEnd]],
 ]) {
@@ -269,7 +297,10 @@ test("transport peer-closed mid-stream continues on a new RunSSE", () => {
 })
 
 test("parallel tool calls across reads are forwarded before closing the batch", () => {
-  const run = hostRun({attempts: [{chunks: [tool("first"), toolCount(2), tool("first"), tool("second")]}]})
+  const checkpoint = frame(field(3, field(4, "first")))
+  const run = hostRun({attempts: [{
+    chunks: [tool("first"), toolCount(2), checkpoint, tool("first"), tool("second")],
+  }]})
   assert.equal(run.done, true)
   const calls = run.frames.flatMap((item) => item.choices[0].delta.tool_calls ?? [])
   assert.deepEqual(calls.map(({id, index}) => [id, index]), [["first", 0], ["second", 1]])
@@ -338,4 +369,153 @@ test("oversized requests and attachments fail before any outbound network call",
     assert.equal(run.output.error.status, status)
     assert.equal(run.attempts, 0)
   }
+})
+
+test("account and upstream auth failures retain their status before opening a stream", () => {
+  for (const scenario of [
+    {accountError: {status: 401, message: "account expired"}},
+    {attempts: [{status: 401, chunks: []}]},
+  ]) {
+    const run = hostRun(scenario)
+    assert.equal(run.output.error.status, 401)
+    assert.ok(!run.calls.includes("stream.head"))
+  }
+})
+
+test("BidiAppend backs off on empty reads and resets the delay after data", () => {
+  const empty = Buffer.alloc(0)
+  const run = hostRun({attempts: [{
+    appendChunks: [empty, empty, Buffer.from("ack"), empty],
+    chunks: [content("ok"), end()],
+  }]})
+  assert.equal(run.done, true)
+  assert.deepEqual(run.sleeps, [50, 100, 50])
+})
+
+test("BidiAppend stops waiting for an empty acknowledgement at its deadline", () => {
+  const run = hostRun({attempts: [{
+    appendChunks: Array(300).fill(Buffer.alloc(0)),
+    chunks: [content("unexpected")],
+  }]})
+  assert.equal(run.output.error.code, "cursor_append_unconfirmed")
+  assert.equal(run.output.error.status, 504)
+  assert.equal(run.elapsed, 60_000)
+  assert.ok(run.sleeps.length < 70)
+  assert.equal(run.attempts, 1)
+  assert.ok(!run.calls.includes("stream.head"))
+})
+
+test("EOF at a frame boundary resumes partial text once without reopening client headers", () => {
+  const run = hostRun({attempts: [
+    {chunks: [content("prefix ")]},
+    {chunks: [content("suffix"), end()]},
+  ]})
+  assert.equal(run.attempts, 2)
+  assert.equal(run.done, true)
+  assert.deepEqual(run.frames.flatMap((frame) => frame.choices[0].delta.content ?? []), ["prefix ", "suffix"])
+  assert.equal(run.calls.filter((call) => call === "stream.head").length, 1)
+})
+
+test("repeated EOFs stop at the continuation limit", () => {
+  const run = hostRun({attempts: Array.from({length: 17}, (_, index) => ({
+    chunks: [content(String(index))],
+  }))})
+  assert.equal(run.attempts, 17)
+  assert.equal(run.done, false)
+  assert.equal(run.output.error.code, "cursor_partial_stream")
+  assert.match(run.output.error.message, /16 次/)
+  assert.equal(run.calls.filter((call) => call === "stream.head").length, 1)
+})
+
+test("EOF before output or after tool calls never resumes", () => {
+  const noOutput = hostRun({attempts: [{chunks: []}]})
+  assert.equal(noOutput.output.error.code, "cursor_stream_eof")
+  assert.ok(!noOutput.calls.includes("stream.head"))
+  const tools = hostRun({attempts: [{chunks: [toolCount(2), tool("first")]}]})
+  assert.equal(tools.output.error.code, "cursor_partial_stream")
+  assert.equal(tools.done, false)
+  assert.equal(tools.attempts, 1)
+})
+
+test("a cancelled upstream read never starts continuation", () => {
+  const run = hostRun({attempts: [{
+    chunks: [content("partial")],
+    readError: {status: 499, message: "peer closed on client cancellation"},
+  }]})
+  assert.equal(run.output.error.status, 499)
+  assert.equal(run.attempts, 1)
+  assert.equal(run.done, false)
+})
+
+test("usage snapshots replace counters within an attempt and sum across continuation", () => {
+  const run = hostRun({attempts: [
+    {
+      chunks: [content("first"), update(31, concat(field(3, 1), field(4, 4)))],
+    },
+    {
+      chunks: [
+        content("second"),
+        update(31, concat(field(2, 10), field(3, 19), field(6, 3))),
+        update(14, concat(field(1, 10), field(2, 20))),
+        end(),
+      ],
+    },
+  ]})
+  assert.equal(run.done, true)
+  assert.deepEqual(run.frames.at(-1).usage, {
+    prompt_tokens: 14,
+    completion_tokens: 21,
+    total_tokens: 35,
+    prompt_tokens_details: {cached_tokens: 4, cache_write_tokens: 0},
+    completion_tokens_details: {reasoning_tokens: 3},
+  })
+})
+
+test("login polling can recover from a settings failure and an expired reservation", () => {
+  const snapshot = {
+    revision: 1, schema: 1, compatible: true,
+    value: {
+      expiresAt: 1_700_000_900_000, nextAt: 0, uuid: "fake", verifier: "fake",
+    },
+  }
+  const poll = {
+    method: "login.poll", params: {},
+    httpResponses: {"/auth/poll": {status: 404}},
+  }
+  const failure = hostRun({...poll, snapshot, settingsError: {status: 503, message: "unavailable"}})
+  assert.equal(failure.output.error.status, 503)
+  assert.deepEqual(failure.snapshot, snapshot)
+  const recovered = hostRun({...poll, snapshot: failure.snapshot})
+  assert.equal(recovered.output.result.state, "pending")
+  assert.ok(recovered.calls.includes("http.open"))
+  assert.equal(recovered.snapshot.value.busyUntil, 0)
+
+  const reserved = hostRun({
+    ...poll, snapshot: {...snapshot, value: {...snapshot.value, busyUntil: 1_700_000_020_000}},
+  })
+  assert.ok(!reserved.calls.includes("http.open"))
+  const expired = hostRun({
+    ...poll, snapshot: {...snapshot, value: {...snapshot.value, busyUntil: 1_699_999_999_000}},
+  })
+  assert.ok(expired.calls.includes("http.open"))
+})
+
+test("empty model refresh preserves the previously discovered catalog", () => {
+  const snapshot = {
+    revision: 1, schema: 1, compatible: true,
+    value: {source: "cursor:test", catalog: {
+      meta: {remote: true, refreshed_at: 1_699_999_000_000},
+      models: [{id: "auto"}, {id: "saved-model"}],
+    }},
+  }
+  const run = hostRun({
+    method: "models.refresh", params: {force: true}, snapshot,
+    httpResponses: {
+      "/aiserver.v1.AiService/AvailableModels": {chunks: ['{"models":[]}']},
+      "/agent.v1.AgentService/GetUsableModels": {chunks: ['{"models":[]}']},
+    },
+  })
+  assert.equal(run.output.result.refreshed, false)
+  assert.equal(run.output.result.count, 2)
+  assert.deepEqual(run.snapshot, snapshot)
 })

@@ -102,6 +102,41 @@ pub fn unary_timeout(path: &str, token: &str, body: Value, timeout_ms: u64) -> R
     response.json()
 }
 
+pub(crate) const EMPTY_READ_INITIAL_MS: u64 = 50;
+const EMPTY_READ_MAX_MS: u64 = 1_000;
+
+pub(crate) fn back_off_empty_read(delay: &mut u64) -> Result<()> {
+    sdk::sleep(*delay)?;
+    *delay = (*delay * 2).min(EMPTY_READ_MAX_MS);
+    Ok(())
+}
+
+pub(crate) fn read_response_bytes(
+    mut response: http::Response,
+    limit: usize,
+    deadline: i64,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut delay = EMPTY_READ_INITIAL_MS;
+    while let Some(chunk) = response.read()? {
+        if chunk.is_empty() {
+            let remaining = deadline.saturating_sub(sdk::now());
+            if remaining <= 0 {
+                return Err(Error::http(504, "等待 Cursor HTTP 响应正文超时"));
+            }
+            delay = delay.min(remaining as u64);
+            back_off_empty_read(&mut delay)?;
+        } else {
+            if output.len().saturating_add(chunk.len()) > limit {
+                return Err(Error::new("上游回应超过大小限制"));
+            }
+            output.extend_from_slice(&chunk);
+            delay = EMPTY_READ_INITIAL_MS;
+        }
+    }
+    Ok(output)
+}
+
 pub fn get_me(token: &str) -> Result<Value> {
     unary("aiserver.v1.DashboardService/GetMe", token, json!({}))
 }

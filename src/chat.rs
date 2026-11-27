@@ -12,8 +12,6 @@ const NS: &str = "tools";
 const CALL: &str = "CallDynamicTool";
 const NO_RESULT: &str = "Tool use was interrupted and did not produce a result.";
 const HEARTBEAT_MS: i64 = 5_000;
-const EMPTY_READ_INITIAL_MS: u64 = 50;
-const EMPTY_READ_MAX_MS: u64 = 1_000;
 const FIRST_OUTPUT_MS: i64 = 60_000;
 const STALL_MS: i64 = 90_000;
 const TOOL_COUNT_WAIT_MS: i64 = 30_000;
@@ -452,6 +450,7 @@ pub(crate) fn bidi_append(headers: &Value, request_id: &str, msg: &[u8], seq: u6
         error.code = Some("cursor_append_unconfirmed".into());
         error
     };
+    let deadline = sdk::now().saturating_add(APPEND_TIMEOUT_MS as i64);
     let response = http::open_raw_timeout(
         "POST",
         &format!("{}/aiserver.v1.BidiService/BidiAppend", client::API),
@@ -461,9 +460,9 @@ pub(crate) fn bidi_append(headers: &Value, request_id: &str, msg: &[u8], seq: u6
     )
     .map_err(unconfirmed)?;
     if !(200..300).contains(&response.status) {
-        return Err(errors::http_response("BidiAppend", response));
+        return Err(errors::http_response("BidiAppend", response, deadline));
     }
-    response.bytes(64 << 10).map_err(unconfirmed)?;
+    client::read_response_bytes(response, 64 << 10, deadline).map_err(unconfirmed)?;
     Ok(())
 }
 
@@ -474,13 +473,15 @@ struct StreamOut<'a> {
     created: i64,
     text: String,
     tools_started: bool,
+    usage: Option<TokenUsage>,
 }
 
 impl StreamOut<'_> {
     fn delta(&mut self, delta: Value) -> Result<()> {
         if !self.started {
-            self.emit(json!({"role":"assistant"}), Value::Null, None)?;
+            sdk::stream_head(200)?;
             self.started = true;
+            self.emit(json!({"role":"assistant"}), Value::Null, None)?;
         }
         if let Some(text) = delta["content"].as_str() {
             self.text.push_str(text);
@@ -491,11 +492,20 @@ impl StreamOut<'_> {
         self.emit(delta, Value::Null, None)
     }
 
-    fn finish(&self, tools: bool, usage: Option<Value>) -> Result<()> {
+    fn record_usage(&mut self, usage: Option<TokenUsage>) {
+        if let Some(usage) = usage {
+            self.usage
+                .get_or_insert_with(TokenUsage::default)
+                .add(usage);
+        }
+    }
+
+    fn finish(&mut self, tools: bool, usage: Option<TokenUsage>) -> Result<()> {
+        self.record_usage(usage);
         self.emit(
             json!({}),
             json!(if tools { "tool_calls" } else { "stop" }),
-            usage,
+            self.usage.as_ref().map(TokenUsage::openai),
         )?;
         sdk::stream_bytes(b"data: [DONE]\n\n")
     }
@@ -515,27 +525,61 @@ impl StreamOut<'_> {
     }
 }
 
-fn usage_of(uf: &[Field], shift: u32) -> Value {
-    let inp = proto::pb_num(uf, 1 + shift);
-    let out = proto::pb_num(uf, 2 + shift);
-    let cr = proto::pb_num(uf, 3 + shift);
-    let cw = proto::pb_num(uf, 4 + shift);
-    let reasoning = proto::pb_num(uf, 5 + shift);
-    let input = inp.saturating_sub(cr).saturating_sub(cw);
-    let prompt = input.saturating_add(cr).saturating_add(cw);
-    let mut usage = json!({
-        "prompt_tokens": prompt,
-        "completion_tokens": out,
-        "total_tokens": prompt.saturating_add(out),
-        "prompt_tokens_details": {
-            "cached_tokens": cr,
-            "cache_write_tokens": cw
+#[derive(Default)]
+struct TokenUsage {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    reasoning: u64,
+}
+
+impl TokenUsage {
+    fn update(&mut self, fields: &[Field], shift: u32) {
+        // Updates 14 and 31 are snapshots of the same run. Retain fields
+        // omitted by later updates and replace counters that are present.
+        for (number, count) in [
+            (1, &mut self.input),
+            (2, &mut self.output),
+            (3, &mut self.cache_read),
+            (4, &mut self.cache_write),
+            (5, &mut self.reasoning),
+        ] {
+            if let Some(field) = proto::field(fields, number + shift) {
+                *count = field.n;
+            }
         }
-    });
-    if reasoning > 0 {
-        usage["completion_tokens_details"] = json!({ "reasoning_tokens": reasoning });
     }
-    usage
+
+    fn add(&mut self, other: Self) {
+        let prompt = other
+            .input
+            .max(other.cache_read.saturating_add(other.cache_write));
+        self.input = self.input.saturating_add(prompt);
+        self.output = self.output.saturating_add(other.output);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.cache_write = self.cache_write.saturating_add(other.cache_write);
+        self.reasoning = self.reasoning.saturating_add(other.reasoning);
+    }
+
+    fn openai(&self) -> Value {
+        let prompt = self
+            .input
+            .max(self.cache_read.saturating_add(self.cache_write));
+        let mut usage = json!({
+            "prompt_tokens": prompt,
+            "completion_tokens": self.output,
+            "total_tokens": prompt.saturating_add(self.output),
+            "prompt_tokens_details": {
+                "cached_tokens": self.cache_read,
+                "cache_write_tokens": self.cache_write
+            }
+        });
+        if self.reasoning > 0 {
+            usage["completion_tokens_details"] = json!({ "reasoning_tokens": self.reasoning });
+        }
+        usage
+    }
 }
 
 fn is_heartbeat(messages: &[Field]) -> bool {
@@ -564,7 +608,7 @@ fn is_resumable_transport_cut(error: &Error) -> bool {
 
 enum AttemptEnd {
     Done,
-    Continue,
+    Continue(Option<TokenUsage>),
 }
 
 pub fn forward(body: Value) -> Result<()> {
@@ -579,7 +623,6 @@ pub fn forward(body: Value) -> Result<()> {
     let (messages, mut last) = conversation_blobs(&body, &tools)?;
     let model_raw = body["model"].as_str().unwrap_or("claude-sonnet-4-6");
     let conv = conversation_id(&body);
-    sdk::stream_head(200)?;
     let (body_max, params) = model_params(&body);
     let account = auth::credentials(false)?;
     let access = account["accessToken"]
@@ -597,6 +640,7 @@ pub fn forward(body: Value) -> Result<()> {
         created: sdk::now() / 1000,
         text: String::new(),
         tools_started: false,
+        usage: None,
     };
     let mut context = RunContext::new(messages, &tools);
     let mut continues = 0_u32;
@@ -615,9 +659,8 @@ pub fn forward(body: Value) -> Result<()> {
             {
                 max_mode = true;
             }
-            Ok(AttemptEnd::Continue)
-                if out.started && !out.tools_started && continues < MAX_STREAM_CONTINUES =>
-            {
+            Ok(AttemptEnd::Continue(usage)) if continues < MAX_STREAM_CONTINUES => {
+                out.record_usage(usage);
                 // Visible text is preferred, but reasoning-only cuts still resume.
                 let partial = &out.text[continued_from..];
                 if !partial.is_empty() {
@@ -635,7 +678,7 @@ pub fn forward(body: Value) -> Result<()> {
                 continues += 1;
             }
             Ok(AttemptEnd::Done) => return Ok(()),
-            Ok(AttemptEnd::Continue) => {
+            Ok(AttemptEnd::Continue(_)) => {
                 return Err(Error::http(
                     502,
                     format!("Cursor 流已输出后中断：传输层切断且续写已用尽（{continues} 次）"),
@@ -758,7 +801,11 @@ fn run_attempt(
         error
     })?;
     if !(200..300).contains(&response.status) {
-        return Err(errors::http_response("RunSSE", response));
+        return Err(errors::http_response(
+            "RunSSE",
+            response,
+            sdk::now().saturating_add(15_000),
+        ));
     }
 
     bidi_append(headers, request_id, first, 0)?;
@@ -774,19 +821,12 @@ fn run_attempt(
     let mut last_beat = started_at;
     let mut last_activity = started_at;
     let mut heartbeats = 0_u32;
-    let mut empty_read_delay = EMPTY_READ_INITIAL_MS;
+    let mut empty_read_delay = client::EMPTY_READ_INITIAL_MS;
     let mut turn_ended = false;
     let mut wrote = false;
     let mut reasoned = false;
     let mut usage = None;
     let mut batch = ToolBatch::default();
-    let resumable = |error: Error, progressed: bool, tools_started: bool| -> Result<AttemptEnd> {
-        if progressed && !tools_started && is_resumable_transport_cut(&error) {
-            Ok(AttemptEnd::Continue)
-        } else {
-            Err(error)
-        }
-    };
 
     loop {
         let now = sdk::now();
@@ -824,42 +864,44 @@ fn run_attempt(
                     "Cursor RunSSE 读取失败（{elapsed} ms，{heartbeats} 次上行心跳，{turn}）：{}",
                     error.message
                 );
-                return resumable(
-                    error,
-                    wrote || reasoned || out.started,
-                    out.tools_started || !batch.emitted.is_empty(),
-                );
+                if out.started
+                    && !out.tools_started
+                    && error.status != Some(499)
+                    && is_resumable_transport_cut(&error)
+                {
+                    return Ok(AttemptEnd::Continue(usage));
+                }
+                return Err(error);
             }
         };
         let Some(chunk) = chunk else {
-            let detail = if decoder.has_partial_frame() {
+            let partial_frame = decoder.has_partial_frame();
+            if !partial_frame && !turn_ended && (wrote || reasoned) && !out.tools_started {
+                return Ok(AttemptEnd::Continue(usage));
+            }
+            let detail = if partial_frame {
                 "Connect 帧未收全"
             } else {
                 "缺少结束帧"
             };
-            let error = Error::http(502, format!("Cursor 回复中断（EOF，{detail}）"))
-                .with_code("cursor_stream_eof");
-            return resumable(
-                error,
-                wrote || reasoned || out.started,
-                out.tools_started || !batch.emitted.is_empty(),
+            return Err(
+                Error::http(502, format!("Cursor 回复中断（EOF，{detail}）"))
+                    .with_code("cursor_stream_eof"),
             );
         };
         if chunk.is_empty() {
             // Empty reads do not replenish the host fuel window. Keep first-byte
             // latency low, then cap polling at 1 Hz so long thinking pauses do not
             // burn the whole window before Cursor produces its next event.
-            sdk::sleep(empty_read_delay)?;
-            empty_read_delay = empty_read_delay.saturating_mul(2).min(EMPTY_READ_MAX_MS);
+            client::back_off_empty_read(&mut empty_read_delay)?;
             continue;
         }
-        empty_read_delay = EMPTY_READ_INITIAL_MS;
+        empty_read_delay = client::EMPTY_READ_INITIAL_MS;
 
         let frames = decoder
             .push(&chunk)
             .map_err(|error| Error::http(502, error).with_code("cursor_connect_protocol"))?;
         let mut frames = frames.into_iter().peekable();
-        let mut checkpoint_ready = false;
         while let Some(frame) = frames.next() {
             if frame.end {
                 if frames.peek().is_some() || decoder.has_partial_frame() {
@@ -907,11 +949,15 @@ fn run_attempt(
                                 ),
                                 14 => {
                                     turn_ended = true;
-                                    usage = Some(usage_of(&fields, 0));
+                                    usage
+                                        .get_or_insert_with(TokenUsage::default)
+                                        .update(&fields, 0);
                                 }
                                 27 => batch.expected = proto::pb_num(&fields, 1),
                                 31 if fields.iter().any(|f| (2..=6).contains(&f.num)) => {
-                                    usage = Some(usage_of(&fields, 1))
+                                    usage
+                                        .get_or_insert_with(TokenUsage::default)
+                                        .update(&fields, 1);
                                 }
                                 _ => {}
                             }
@@ -936,13 +982,6 @@ fn run_attempt(
                             batch.answered += 1;
                         }
                     }
-                    3 if batch.expected > 0 && !batch.emitted.is_empty() => {
-                        let pending = proto::checked_fields_502(&message.data)?
-                            .into_iter()
-                            .filter(|field| field.num == 4)
-                            .count();
-                        checkpoint_ready = pending == batch.emitted.len();
-                    }
                     4 => handle_kv(&message.data, context, &mut seq, headers, request_id)?,
                     _ => {}
                 }
@@ -952,7 +991,7 @@ fn run_attempt(
                 }
             }
         }
-        if !decoder.has_partial_frame() && (batch.ready() || checkpoint_ready) {
+        if !decoder.has_partial_frame() && batch.ready() {
             // Cursor waits for tool results once the declared batch has arrived.
             // The caller supplies results in a new request.
             out.finish(true, usage)?;

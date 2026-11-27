@@ -380,54 +380,53 @@ fn parse_models(body: &Value, usable: Option<&std::collections::BTreeSet<String>
         } else {
             for ctx in contexts {
                 let id = format!("{name}@{ctx}");
-                if seen.insert(id.clone()) {
-                    let tokens = parse_context_tokens(&ctx).unwrap_or(limit);
-                    // Prefer a stable (non-fast / non-thinking) variant at this context.
-                    let ctx_match = |v: &Value| {
-                        v.pointer("/parameterValues/context")
-                            .or_else(|| v.get("context"))
-                            .and_then(Value::as_str)
-                            == Some(ctx.as_str())
-                    };
-                    let ctx_variants: Vec<&Value> = row
-                        .get("variants")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter(|v| ctx_match(v))
-                        .collect();
-                    let ctx_v = ctx_variants
-                        .iter()
-                        .copied()
-                        .find(|v| variant_slug(v).is_some_and(is_stable_slug))
-                        .or_else(|| ctx_variants.first().copied());
-                    let ctx_run = ctx_v
-                        .and_then(variant_slug)
-                        .map(str::to_string)
-                        .or(run.clone());
-                    let ctx_max = ctx_v
-                        .map(|v| row["supportsNonMaxMode"] == false || v["isMaxMode"] == true)
-                        .unwrap_or(max_mode);
-                    out.push(model(
-                        &id,
-                        &format!("{title} @ {ctx}"),
-                        tokens,
-                        ctx_run.as_deref(),
-                        ctx_max,
-                    ));
+                if seen.contains(&id) {
+                    continue;
                 }
+                // Prefer a stable (non-fast / non-thinking) variant at this context.
+                let ctx_match = |v: &Value| {
+                    v.pointer("/parameterValues/context")
+                        .or_else(|| v.get("context"))
+                        .and_then(Value::as_str)
+                        == Some(ctx.as_str())
+                };
+                let ctx_variants: Vec<&Value> = row
+                    .get("variants")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|v| {
+                        ctx_match(v)
+                            && usable.is_none_or(|ids| {
+                                variant_slug(v)
+                                    .map_or_else(|| ids.contains(name), |slug| ids.contains(slug))
+                            })
+                    })
+                    .collect();
+                let Some(ctx_v) = ctx_variants
+                    .iter()
+                    .copied()
+                    .find(|v| variant_slug(v).is_some_and(is_stable_slug))
+                    .or_else(|| ctx_variants.first().copied())
+                else {
+                    continue;
+                };
+                let ctx_run = variant_slug(ctx_v).unwrap_or(name);
+                let ctx_max = row["supportsNonMaxMode"] == false || ctx_v["isMaxMode"] == true;
+                let tokens = parse_context_tokens(&ctx).unwrap_or(limit);
+                seen.insert(id.clone());
+                out.push(model(
+                    &id,
+                    &format!("{title} @ {ctx}"),
+                    tokens,
+                    Some(ctx_run),
+                    ctx_max,
+                ));
             }
         }
     }
 
-    if out.is_empty() {
-        FALLBACK
-            .iter()
-            .map(|(id, name, limit)| model(id, name, *limit, None, false))
-            .collect()
-    } else {
-        out
-    }
+    out
 }
 
 fn parse_context_tokens(ctx: &str) -> Option<i64> {
@@ -628,6 +627,25 @@ mod tests {
             Some(&usable),
         );
         assert_eq!(models[0]["runId"], "composer-2.5");
+    }
+
+    #[test]
+    fn context_variants_only_use_available_slugs_for_the_same_context() {
+        let directory = json!({"models": [{
+            "name": "model",
+            "variants": [
+                {"legacySlug": "model-old", "context": "200k"},
+                {"legacySlug": "model-new", "context": "200k", "isMaxMode": true},
+                {"legacySlug": "model-long", "context": "1m"}
+            ]
+        }]});
+        let usable = ["model-new".to_string()].into_iter().collect();
+        let models = parse_models(&directory, Some(&usable));
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["id"], "model@200k");
+        assert_eq!(models[0]["runId"], "model-new");
+        assert_eq!(models[0]["maxMode"], true);
+        assert_eq!(parse_models(&directory, None).len(), 2);
     }
 
     #[test]

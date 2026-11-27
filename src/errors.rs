@@ -115,13 +115,13 @@ fn max_mode_required(message: &str) -> bool {
     (lower.contains("max mode") && lower.contains("required")) || lower.contains("请开启 max mode")
 }
 
-pub fn http_response(operation: &str, response: http::Response) -> Error {
+pub fn http_response(operation: &str, response: http::Response, deadline: i64) -> Error {
     let status = response.status;
     let reset = response
         .header_values("Retry-After")
         .into_iter()
         .find_map(retry_after);
-    let body = match response.bytes(256 << 10) {
+    let body = match super::client::read_response_bytes(response, 256 << 10, deadline) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| json!({"message": String::from_utf8_lossy(&bytes)})),
         Err(error) => json!({ "message": error.message }),
